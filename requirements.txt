@@ -1,0 +1,8 @@
+Django>=4.2
+openai
+TTS
+soundfile
+numpy
+scipy
+requests
+gunicorn

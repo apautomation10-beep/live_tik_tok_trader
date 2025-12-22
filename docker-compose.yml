@@ -1,0 +1,15 @@
+version: '3.8'
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY
+      - DEBUG=1
+    volumes:
+      - ./media:/app/media
+      - tts_models:/app/tts_models
+
+volumes:
+  tts_models:
