@@ -362,7 +362,7 @@ TTS_MODELS = {
 }
 
 # ~3 minutes per audio
-WORDS_PER_AUDIO = 500
+WORDS_PER_AUDIO = 600
 
 
 def dashboard(request):
@@ -428,9 +428,7 @@ def delete_all_recordings(request):
                 errors.append(str(e))
 
     return JsonResponse({'deleted': deleted, 'errors': errors})
-
-
-def split_text_into_chunks(text, words_per_chunk=WORDS_PER_AUDIO):
+def split_text_into_chunks(text, words_per_chunk=600):
     words = text.split()
     return [
         " ".join(words[i:i + words_per_chunk])
@@ -442,11 +440,28 @@ def generate_long_commentary(client, model_name, base_prompt, max_tokens, parts=
     full_text = ""
     last_context = ""
 
+    # detect Spanish from base prompt
+    is_spanish = "espanol" in base_prompt.lower() or "español" in base_prompt.lower()
+
     for i in range(parts):
         if i == 0:
             prompt = base_prompt
         else:
-            prompt = f"""
+            if is_spanish:
+                prompt = f"""
+Continua la misma transmision en vivo sobre el mercado del oro XAUUSD
+
+No repitas ideas anteriores
+
+Contexto previo
+{last_context}
+
+Escribe aproximadamente tres mil palabras mas
+Sigue todas las reglas anteriores
+Usa solo espanol
+"""
+            else:
+                prompt = f"""
 Continue the same XAUUSD gold market commentary
 
 Do not repeat earlier ideas
@@ -461,7 +476,12 @@ Plain spoken English
 
         response = client.responses.create(
             model=model_name,
-            input=prompt,
+            input=[
+                {
+                    "role": "system",
+                    "content": prompt
+                }
+            ],
             max_output_tokens=max_tokens,
         )
 
@@ -486,6 +506,7 @@ Plain spoken English
 
     return full_text.strip()
 
+
 @csrf_exempt
 def go_live(request):
     if request.method != 'POST':
@@ -502,8 +523,8 @@ def go_live(request):
     # OPENAI
     # ------------------------
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    model_name = os.environ.get('OPENAI_MODEL', 'gpt-4o-mini')
-    max_tokens = int(os.environ.get('OPENAI_MAX_TOKENS', '12000'))
+    model_name = os.environ.get('OPENAI_MODEL', 'gpt-5-mini')  
+    max_tokens = int(os.environ.get('OPENAI_MAX_TOKENS', '16000'))
 
     prompt = PROMPT_ES if language == 'es' else PROMPT_EN
 
@@ -513,7 +534,7 @@ def go_live(request):
             model_name=model_name,
             base_prompt=prompt,
             max_tokens=max_tokens,
-            parts=3
+            parts=3  # reduced from 6 to 3
         )
     except Exception as e:
         traceback.print_exc()
@@ -522,7 +543,7 @@ def go_live(request):
     # ------------------------
     # SPLIT FOR TTS
     # ------------------------
-    chunks = split_text_into_chunks(text)
+    chunks = split_text_into_chunks(text, words_per_chunk=600)
 
     tts_model = TTS_MODELS.get(language, TTS_MODELS['en'])
     local_models_root = os.environ.get('TTS_MODEL_PATH', '/app/tts_models')
@@ -530,6 +551,7 @@ def go_live(request):
     local_model_path = os.path.join(local_models_root, safe_name)
 
     audio_urls = []
+    session_ts = int(time.time())
 
     try:
         if os.path.isdir(local_model_path):
@@ -538,14 +560,14 @@ def go_live(request):
             tts = TTS(model_name=tts_model, progress_bar=False, gpu=False)
 
         for idx, chunk in enumerate(chunks):
-            filename = f"live_{int(time.time())}_{idx}.wav"
+            filename = f"live_{session_ts}_{idx}.wav"
             filepath = os.path.join(settings.MEDIA_ROOT, filename)
 
             if language == 'es':
                 tts.tts_to_file(
                     text=chunk,
                     file_path=filepath,
-                    length_scale=1.35,
+                    length_scale=1.25,
                     noise_scale=0.65,
                     noise_scale_w=0.8
                 )
