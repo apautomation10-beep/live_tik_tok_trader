@@ -1,25 +1,30 @@
 version: '3.8'
-
 services:
   web:
     build: .
     ports:
       - "8000:8000"
-    env_file:
-      - .env
+    environment:
+      - OPENAI_API_KEY
+      - DEBUG=1
     volumes:
       - ./media:/app/media
       - tts_models:/app/tts_models
-    restart: unless-stopped  # auto-restart if container stops
 
+  # TikTok listener runs as a separate service and posts comments to the web service
   tiktok:
     build: .
     command: ["python", "/app/scripts/tiktok_listener.py"]
-    env_file:
-      - .env
+    restart: unless-stopped
     depends_on:
       - web
-    restart: unless-stopped  # auto-restart if container stops
+    environment:
+      - TIKTOK_USERNAME
+      - TIKTOK_POST_URL=http://web:8000/tiktok/comment/
+      - TIKTOK_SECRET
+    volumes:
+      - ./media:/app/media
+      - tts_models:/app/tts_models
 
 volumes:
   tts_models:

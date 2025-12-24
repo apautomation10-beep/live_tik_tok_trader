@@ -5,12 +5,7 @@ import collections
 import traceback
 import torch
 import re
-import random
-import hashlib
 from datetime import datetime
-import logging
-import uuid
-
 
 from django.shortcuts import render
 from django.http import JsonResponse
@@ -367,7 +362,7 @@ TTS_MODELS = {
 }
 
 # ~3 minutes per audio
-WORDS_PER_AUDIO = 600
+WORDS_PER_AUDIO = 250
 
 
 def dashboard(request):
@@ -376,45 +371,43 @@ def dashboard(request):
 
 @csrf_exempt
 def list_recordings(request):
-    """Return all audio recordings found in MEDIA_ROOT (wav and mp3).
-
-    Previously this grouped by live_{ts}_{idx}.wav pattern; for production use we present
-    a single "all" view that contains every audio file (commentary and replies).
-    """
+    """Return all recordings grouped by live session (based on filename pattern live_{ts}_{idx}.wav)."""
     media_root = settings.MEDIA_ROOT
     media_url = settings.MEDIA_URL
     if not os.path.isdir(media_root):
         return JsonResponse({'sessions': []})
 
-    files = []
+    sessions = {}
+    pattern = re.compile(r'^live_(\d+)_\d+\.(wav|mp3)$')
+
     for fn in os.listdir(media_root):
-        if not fn.lower().endswith(('.wav', '.mp3')):
+        m = pattern.match(fn)
+        if not m:
             continue
+        ts = m.group(1)
+        url = media_url + fn
+        sessions.setdefault(ts, []).append({'filename': fn, 'url': url})
+
+    result = []
+    for ts, files in sessions.items():
         try:
-            mtime = os.path.getmtime(os.path.join(media_root, fn))
-            created = datetime.utcfromtimestamp(int(mtime)).strftime('%Y-%m-%d %H:%M:%S UTC')
+            ts_int = int(ts)
+            created = datetime.utcfromtimestamp(ts_int).strftime('%Y-%m-%d %H:%M:%S UTC')
         except Exception:
-            created = ''
-        files.append({'filename': fn, 'url': media_url + fn, 'created_at': created, 'mtime': mtime})
+            created = ts
+        result.append({
+            'session': ts,
+            'created_at': created,
+            'files': sorted(files, key=lambda x: x['filename'])
+        })
 
-    # sort by modification time descending
-    files = sorted(files, key=lambda x: x.get('mtime', 0), reverse=True)
-
-    session = {
-        'session': 'all',
-        'created_at': files[0]['created_at'] if files else '',
-        'files': files
-    }
-
-    return JsonResponse({'sessions': [session]})
+    result = sorted(result, key=lambda x: x['created_at'], reverse=True)
+    return JsonResponse({'sessions': result})
 
 
 @csrf_exempt
 def delete_all_recordings(request):
-    """Delete all audio files (wav, mp3) in MEDIA_ROOT (commentary and replies).
-
-    This intentionally targets only audio files to avoid removing queue/state files.
-    """
+    """Delete all recordings that match the live_\d+_\d+.wav|mp3 pattern."""
     if request.method != 'POST':
         return JsonResponse({'error': 'POST required'}, status=400)
 
@@ -424,7 +417,7 @@ def delete_all_recordings(request):
 
     deleted = 0
     errors = []
-    pattern = re.compile(r'.*\.(wav|mp3)$', flags=re.IGNORECASE)
+    pattern = re.compile(r'^live_\d+_\d+\.(wav|mp3)$')
 
     for fn in os.listdir(media_root):
         if pattern.match(fn):
@@ -437,7 +430,7 @@ def delete_all_recordings(request):
     return JsonResponse({'deleted': deleted, 'errors': errors})
 
 
-def split_text_into_chunks(text, words_per_chunk=600):
+def split_text_into_chunks(text, words_per_chunk=WORDS_PER_AUDIO):
     words = text.split()
     return [
         " ".join(words[i:i + words_per_chunk])
@@ -552,7 +545,8 @@ def go_live(request):
     # ------------------------
     # SPLIT FOR TTS
     # ------------------------
-    chunks = split_text_into_chunks(text, words_per_chunk=600)
+    chunks = split_text_into_chunks(text, words_per_chunk=WORDS_PER_AUDIO)
+
 
     tts_model = TTS_MODELS.get(language, TTS_MODELS['en'])
     local_models_root = os.environ.get('TTS_MODEL_PATH', '/app/tts_models')
@@ -576,9 +570,10 @@ def go_live(request):
                 tts.tts_to_file(
                     text=chunk,
                     file_path=filepath,
-                    length_scale=1.35,
-                    noise_scale=0.65,
-                    noise_scale_w=0.8
+                   length_scale=1.45,
+                    noise_scale=0.6,
+                    noise_scale_w=0.75
+
                 )
             else:
                 tts.tts_to_file(
@@ -599,8 +594,11 @@ def go_live(request):
         'language': language,
         'total_chunks': len(audio_urls),
         'audio_urls': audio_urls,
-        'text': text
+        'text': text,
+        'session_ts': session_ts
     })
+
+
 
 # ------------------------
 # TikTok comment -> 1-minute batch reply pipeline (concurrency-safe, atomic file handling)

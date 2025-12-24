@@ -1,3 +1,6 @@
+// Safe merged main.js: preserves previous go-live + recordings + delete functionality
+// and adds TikTok reply polling with interruption/resume handling and SSE support.
+
 const goLiveBtn = document.getElementById('go-live');
 const langSelect = document.getElementById('lang');
 const status = document.getElementById('status');
@@ -8,27 +11,33 @@ const refreshBtn = document.getElementById('refresh-recordings');
 
 let audioQueue = [];
 let currentIndex = 0;
+let sse = null;
 
-/**
- * Play next audio file in queue
- */
+function safeEl(el, name) {
+  if (!el) console.warn(`${name} not found in DOM`);
+  return el;
+}
+
+/** Play next audio in queue */
 function playNext() {
+  if (!player) return;
   if (currentIndex >= audioQueue.length) {
-    status.textContent = 'Live session finished.';
-    goLiveBtn.disabled = false;
+    if (status) status.textContent = 'Live session finished.';
+    if (goLiveBtn) goLiveBtn.disabled = false;
     return;
   }
 
-  player.src = audioQueue[currentIndex];
-  player.play();
-
-  status.textContent = `Playing segment ${currentIndex + 1} / ${audioQueue.length}`;
-  currentIndex++;
+  try {
+    player.src = audioQueue[currentIndex];
+    player.play().catch(() => {});
+    if (status) status.textContent = `Playing segment ${currentIndex + 1} / ${audioQueue.length}`;
+    currentIndex++;
+  } catch (e) {
+    console.error('playNext failed', e);
+  }
 }
 
-/**
- * Fetch existing recordings and render them
- */
+/** Fetch existing recordings and render */
 async function fetchRecordings() {
   if (!recordingsContainer) return;
   recordingsContainer.innerHTML = 'Loading...';
@@ -70,9 +79,7 @@ function renderSessions(sessions) {
   recordingsContainer.innerHTML = html;
 }
 
-/**
- * Delete all recordings
- */
+/** Delete all recordings (commentary and replies) */
 if (deleteAllBtn) {
   deleteAllBtn.addEventListener('click', async () => {
     if (!confirm('Are you sure you want to delete all audio files (commentary and replies)? This cannot be undone.')) return;
@@ -82,11 +89,10 @@ if (deleteAllBtn) {
     try {
       const res = await fetch('/delete-recordings/', { method: 'POST' });
       const data = await res.json();
-      status.textContent = `Deleted ${data.deleted} files`;
-      // refresh the listing after deletion
+      if (status) status.textContent = `Deleted ${data.deleted} files`;
       await fetchRecordings();
     } catch (err) {
-      status.textContent = 'Delete failed: ' + err;
+      if (status) status.textContent = 'Delete failed: ' + err;
       console.error(err);
     }
 
@@ -99,73 +105,92 @@ if (refreshBtn) {
   refreshBtn.addEventListener('click', fetchRecordings);
 }
 
-/**
- * Handle Go Live click
- */
-goLiveBtn.addEventListener('click', async () => {
-  goLiveBtn.disabled = true;
-  status.textContent = 'Generating commentary and voice... please wait.';
-  audioQueue = [];
-  currentIndex = 0;
+/** Handle Go Live click (generate commentary + start playback) */
+if (goLiveBtn) {
+  goLiveBtn.addEventListener('click', async () => {
+    goLiveBtn.disabled = true;
+    if (status) status.textContent = 'Generating commentary and voice... please wait.';
+    audioQueue = [];
+    currentIndex = 0;
 
-  try {
-    const res = await fetch('/go-live/', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        language: langSelect.value
-      })
-    });
-
-    const data = await res.json();
-
-    if (!res.ok || !data.audio_urls || data.audio_urls.length === 0) {
-      status.textContent = 'Error: ' + (data.error || 'No audio generated');
-      goLiveBtn.disabled = false;
-      return;
+    // close existing SSE if any
+    if (sse) {
+      try { sse.close(); } catch (e) {}
+      sse = null;
     }
 
-    audioQueue = data.audio_urls;
-    status.textContent = `Starting live audio (1 / ${audioQueue.length})`;
+    try {
+      const res = await fetch('/go-live/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ language: (langSelect && langSelect.value) || 'en' })
+      });
 
-    // refresh recordings list after generation
-    fetchRecordings();
+      const data = await res.json();
 
-    playNext();
+      if (!res.ok || !data.audio_urls || data.audio_urls.length === 0) {
+        if (status) status.textContent = 'Error: ' + (data.error || 'No audio generated');
+        if (goLiveBtn) goLiveBtn.disabled = false;
+        return;
+      }
 
-  } catch (err) {
-    status.textContent = 'Request failed: ' + err;
-    goLiveBtn.disabled = false;
-  }
-});
+      audioQueue = data.audio_urls;
+      if (status) status.textContent = `Starting live audio (1 / ${audioQueue.length})`;
 
-/**
- * Auto-play next chunk when current finishes
- */
-player.addEventListener('ended', playNext);
+      // refresh recordings list after generation
+      fetchRecordings();
 
-// Polling and reply interruption handling
+      playNext();
+
+      // If server provided a session timestamp, open SSE to receive new audio pushes (if server supports it)
+      const sessionId = data.session_ts || null;
+      if (sessionId && typeof EventSource !== 'undefined') {
+        try {
+          sse = new EventSource(`/live-audio-sse/${sessionId}/`);
+          sse.addEventListener('new-audio', e => {
+            try {
+              const payload = JSON.parse(e.data);
+              if (payload && payload.url) {
+                audioQueue.push(payload.url);
+                // update UI
+                if (status) status.textContent = `Received new audio (total ${audioQueue.length})`;
+              }
+            } catch (err) {
+              console.error('Bad SSE payload', err);
+            }
+          });
+          sse.onerror = (err) => { console.warn('SSE error', err); };
+        } catch (e) {
+          console.warn('SSE not available', e);
+        }
+      }
+
+    } catch (err) {
+      if (status) status.textContent = 'Request failed: ' + err;
+      if (goLiveBtn) goLiveBtn.disabled = false;
+    }
+  });
+}
+
+// Auto-play next chunk when current finishes
+if (player) player.addEventListener('ended', playNext);
+
+// --- Reply polling and interruption handling ---
 let replyQueue = [];
 let isPlayingReply = false;
 let pausedComment = null; // { index, time }
 
 async function pollForReplies() {
-  // only poll while a live session is running
-  if (goLiveBtn.disabled !== true) return;
+  // only poll while a live session is running (goLiveBtn.disabled === true)
+  if (!goLiveBtn || goLiveBtn.disabled !== true) return;
   try {
     const res = await fetch('/replies/next/');
     if (!res.ok) return;
     const data = await res.json();
     if (data.found && data.url) {
-      // enqueue reply
       replyQueue.push(data.url);
-      status.textContent = `Queued live reply (${replyQueue.length} pending)`;
-      // if we are not currently playing a reply, start the reply playback flow
-      if (!isPlayingReply) {
-        startReplyPlayback();
-      }
+      if (status) status.textContent = `Queued live reply (${replyQueue.length} pending)`;
+      if (!isPlayingReply) startReplyPlayback();
     }
   } catch (err) {
     console.error('Reply poll failed', err);
@@ -174,13 +199,13 @@ async function pollForReplies() {
 
 async function startReplyPlayback() {
   if (!replyQueue.length) return;
-  // Pause commentary and remember where we were
+
+  // pause commentary and remember position
   if (!isPlayingReply) {
-    // if the player is currently playing commentary, save index and currentTime
-    if (!player.paused) {
+    if (player && !player.paused) {
       const currentPlayingIndex = Math.max(0, currentIndex - 1);
       pausedComment = { index: currentPlayingIndex, time: player.currentTime || 0 };
-      player.pause();
+      try { player.pause(); } catch (e) {}
     } else {
       pausedComment = null;
     }
@@ -188,78 +213,81 @@ async function startReplyPlayback() {
 
   isPlayingReply = true;
 
-  // Play all queued replies in order
   while (replyQueue.length) {
     const url = replyQueue.shift();
-    status.textContent = `Playing live reply (${replyQueue.length} remaining)`;
+    if (status) status.textContent = `Playing live reply (${replyQueue.length} remaining)`;
     await playReplyOnce(url);
   }
 
-  // Finished replies, resume commentary exactly where we paused
   await resumeCommentary();
   isPlayingReply = false;
 }
 
 function playReplyOnce(url) {
-  return new Promise((resolve, reject) => {
-    const r = new Audio(url);
-    r.preload = 'auto';
-    r.addEventListener('ended', () => resolve());
-    r.addEventListener('error', (e) => {
-      console.error('Reply play error', e);
+  return new Promise((resolve) => {
+    try {
+      const r = new Audio(url);
+      r.preload = 'auto';
+      r.addEventListener('ended', () => resolve());
+      r.addEventListener('error', (e) => {
+        console.error('Reply play error', e);
+        resolve();
+      });
+      r.play().catch((e) => {
+        console.error('Reply play failed', e);
+        resolve();
+      });
+    } catch (e) {
+      console.error('playReplyOnce failed', e);
       resolve();
-    });
-    r.play().catch((e) => {
-      console.error('Reply play failed', e);
-      resolve();
-    });
+    }
   });
 }
 
 function resumeCommentary() {
-  return new Promise((resolve, reject) => {
-    status.textContent = 'Resuming live commentary';
+  return new Promise((resolve) => {
+    if (status) status.textContent = 'Resuming live commentary';
 
     if (!pausedComment) {
-      // nothing to resume, just ensure main playback continues
-      if (player.src && player.paused) player.play();
+      if (player && player.src && player.paused) player.play().catch(() => {});
       return resolve();
     }
 
     const resumeIndex = pausedComment.index;
     const resumeTime = pausedComment.time || 0;
 
-    // Set the player to the paused segment and seek to saved time
-    player.src = audioQueue[resumeIndex];
+    // validate index
+    if (!audioQueue[resumeIndex]) {
+      // nothing to resume, try to continue with next segment
+      if (player && player.paused) player.play().catch(() => {});
+      return resolve();
+    }
 
-    // Update currentIndex to reflect that this segment is now playing
-    currentIndex = resumeIndex + 1;
+    try {
+      player.src = audioQueue[resumeIndex];
+      currentIndex = resumeIndex + 1;
 
-    const onCanSeek = () => {
-      try {
-        // Some browsers require a small delay before setting currentTime
-        player.currentTime = Math.max(0, Math.min(resumeTime, player.duration || resumeTime));
-      } catch (e) {
-        // ignore; will start from nearest possible position
-        console.warn('Failed to set resume currentTime', e);
-      }
-      player.play().then(() => {
-        status.textContent = `Playing segment ${currentIndex} / ${audioQueue.length}`;
-        player.removeEventListener('canplay', onCanSeek);
-        resolve();
-      }).catch((e) => {
-        console.error('Resume play failed', e);
-        player.removeEventListener('canplay', onCanSeek);
-        resolve();
-      });
-    };
+      const onCanSeek = () => {
+        try {
+          player.currentTime = Math.max(0, Math.min(resumeTime, player.duration || resumeTime));
+        } catch (e) { console.warn('Failed to set resume time', e); }
+        player.play().then(() => {
+          if (status) status.textContent = `Playing segment ${currentIndex} / ${audioQueue.length}`;
+          player.removeEventListener('canplay', onCanSeek);
+          resolve();
+        }).catch((e) => {
+          console.error('Resume play failed', e);
+          player.removeEventListener('canplay', onCanSeek);
+          resolve();
+        });
+      };
 
-    // Attach handler and try to trigger metadata load if needed
-    player.addEventListener('canplay', onCanSeek);
-    // In case canplay already fired, try to call directly after a tick
-    setTimeout(() => {
-      if (player.readyState >= 2) onCanSeek();
-    }, 200);
+      player.addEventListener('canplay', onCanSeek);
+      setTimeout(() => { if (player.readyState >= 2) onCanSeek(); }, 200);
+    } catch (e) {
+      console.error('resumeCommentary failed', e);
+      resolve();
+    }
   });
 }
 
