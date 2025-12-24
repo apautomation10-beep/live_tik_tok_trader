@@ -1,4 +1,5 @@
-FROM python:3.11-slim
+# Use Python 3.10 slim for compatibility with TikTokLive 0.7.1
+FROM python:3.10-slim
 
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app
@@ -27,9 +28,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy project
 COPY . /app/
 
-# TTS models path (created at build and used at runtime)
+# TTS models path
 ENV TTS_MODEL_PATH=/app/tts_models
 RUN mkdir -p /app/tts_models
+
 
 # Pre-download models during build so they are cached in the image and not redownloaded on every build.
 # If you prefer a bind-mounted host folder, make sure to populate `./tts_models` on the host first,
@@ -38,6 +40,8 @@ RUN mkdir -p /app/tts_models
 #RUN if [ -f /app/scripts/download_models.py ]; then python /app/scripts/download_models.py || true; fi
 
 # Add an entrypoint that downloads models at container start only when missing
+
+# Add entrypoint script
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 ENTRYPOINT ["/app/entrypoint.sh"]
@@ -49,4 +53,7 @@ EXPOSE 8000
 
 ENV DJANGO_SETTINGS_MODULE=live_tts_project.settings
 
-CMD ["/bin/bash", "-lc", "python manage.py migrate --noinput && python manage.py runserver 0.0.0.0:8000"]
+# Use gunicorn instead of runserver for stability
+RUN pip install gunicorn
+
+CMD ["sh", "-c", "python manage.py migrate --noinput && gunicorn live_tts_project.wsgi:application --bind 0.0.0.0:8000 --workers 3"]

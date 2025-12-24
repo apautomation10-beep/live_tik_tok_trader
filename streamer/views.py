@@ -5,7 +5,12 @@ import collections
 import traceback
 import torch
 import re
+import random
+import hashlib
 from datetime import datetime
+import logging
+import uuid
+
 
 from django.shortcuts import render
 from django.http import JsonResponse
@@ -371,43 +376,45 @@ def dashboard(request):
 
 @csrf_exempt
 def list_recordings(request):
-    """Return all recordings grouped by live session (based on filename pattern live_{ts}_{idx}.wav)."""
+    """Return all audio recordings found in MEDIA_ROOT (wav and mp3).
+
+    Previously this grouped by live_{ts}_{idx}.wav pattern; for production use we present
+    a single "all" view that contains every audio file (commentary and replies).
+    """
     media_root = settings.MEDIA_ROOT
     media_url = settings.MEDIA_URL
     if not os.path.isdir(media_root):
         return JsonResponse({'sessions': []})
 
-    sessions = {}
-    pattern = re.compile(r'^live_(\d+)_\d+\.(wav|mp3)$')
-
+    files = []
     for fn in os.listdir(media_root):
-        m = pattern.match(fn)
-        if not m:
+        if not fn.lower().endswith(('.wav', '.mp3')):
             continue
-        ts = m.group(1)
-        url = media_url + fn
-        sessions.setdefault(ts, []).append({'filename': fn, 'url': url})
-
-    result = []
-    for ts, files in sessions.items():
         try:
-            ts_int = int(ts)
-            created = datetime.utcfromtimestamp(ts_int).strftime('%Y-%m-%d %H:%M:%S UTC')
+            mtime = os.path.getmtime(os.path.join(media_root, fn))
+            created = datetime.utcfromtimestamp(int(mtime)).strftime('%Y-%m-%d %H:%M:%S UTC')
         except Exception:
-            created = ts
-        result.append({
-            'session': ts,
-            'created_at': created,
-            'files': sorted(files, key=lambda x: x['filename'])
-        })
+            created = ''
+        files.append({'filename': fn, 'url': media_url + fn, 'created_at': created, 'mtime': mtime})
 
-    result = sorted(result, key=lambda x: x['created_at'], reverse=True)
-    return JsonResponse({'sessions': result})
+    # sort by modification time descending
+    files = sorted(files, key=lambda x: x.get('mtime', 0), reverse=True)
+
+    session = {
+        'session': 'all',
+        'created_at': files[0]['created_at'] if files else '',
+        'files': files
+    }
+
+    return JsonResponse({'sessions': [session]})
 
 
 @csrf_exempt
 def delete_all_recordings(request):
-    """Delete all recordings that match the live_\d+_\d+.wav|mp3 pattern."""
+    """Delete all audio files (wav, mp3) in MEDIA_ROOT (commentary and replies).
+
+    This intentionally targets only audio files to avoid removing queue/state files.
+    """
     if request.method != 'POST':
         return JsonResponse({'error': 'POST required'}, status=400)
 
@@ -417,7 +424,7 @@ def delete_all_recordings(request):
 
     deleted = 0
     errors = []
-    pattern = re.compile(r'^live_\d+_\d+\.(wav|mp3)$')
+    pattern = re.compile(r'.*\.(wav|mp3)$', flags=re.IGNORECASE)
 
     for fn in os.listdir(media_root):
         if pattern.match(fn):
@@ -428,6 +435,8 @@ def delete_all_recordings(request):
                 errors.append(str(e))
 
     return JsonResponse({'deleted': deleted, 'errors': errors})
+
+
 def split_text_into_chunks(text, words_per_chunk=600):
     words = text.split()
     return [
@@ -567,7 +576,7 @@ def go_live(request):
                 tts.tts_to_file(
                     text=chunk,
                     file_path=filepath,
-                    length_scale=1.25,
+                    length_scale=1.35,
                     noise_scale=0.65,
                     noise_scale_w=0.8
                 )
@@ -592,3 +601,347 @@ def go_live(request):
         'audio_urls': audio_urls,
         'text': text
     })
+
+# ------------------------
+# TikTok comment -> 1-minute batch reply pipeline (concurrency-safe, atomic file handling)
+# ------------------------
+
+import logging
+import uuid
+
+logger = logging.getLogger(__name__)
+
+QUEUE_FILE = os.path.join(settings.MEDIA_ROOT, 'tiktok_reply_queue.json')
+LOCK_FILE = os.path.join(settings.MEDIA_ROOT, 'tiktok_reply_queue.lock')
+MAX_BATCH_COMMENTS = int(os.environ.get('TIKTOK_MAX_BATCH_COMMENTS', '20'))
+LOCK_TIMEOUT = float(os.environ.get('TIKTOK_LOCK_TIMEOUT', '5.0'))
+
+# Emoji regex
+try:
+    EMOJI_RE = re.compile(r'[\U0001F300-\U0001F6FF\U0001F900-\U0001F9FF\U0001F1E6-\U0001F1FF]', flags=re.UNICODE)
+except re.error:
+    EMOJI_RE = re.compile(r'[\u2600-\u26FF\u2700-\u27BF]', flags=re.UNICODE)
+
+
+# ------------------------
+# Simple file lock helpers
+# ------------------------
+
+def _acquire_lock(timeout=LOCK_TIMEOUT):
+    start = time.time()
+    while True:
+        try:
+            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            if time.time() - start > timeout:
+                return False
+            time.sleep(0.05)
+
+
+def _release_lock():
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except Exception:
+        logger.exception('Failed to release lock')
+
+
+# ------------------------
+# Queue helpers (atomic with lock)
+# ------------------------
+
+def _ensure_queue():
+    if not os.path.isdir(settings.MEDIA_ROOT):
+        os.makedirs(settings.MEDIA_ROOT, exist_ok=True)
+
+    if not os.path.exists(QUEUE_FILE):
+        with open(QUEUE_FILE, 'w', encoding='utf-8') as fh:
+            json.dump({
+                'window_start': 0,
+                'comments': [],
+                'audio_queue': []
+            }, fh)
+
+
+def _load_queue_locked():
+    if not _acquire_lock():
+        raise RuntimeError('Failed to acquire queue lock for load')
+    try:
+        _ensure_queue()
+        with open(QUEUE_FILE, 'r', encoding='utf-8') as fh:
+            return json.load(fh)
+    finally:
+        _release_lock()
+
+
+def _save_queue_locked(obj):
+    if not _acquire_lock():
+        raise RuntimeError('Failed to acquire queue lock for save')
+    try:
+        tmp = QUEUE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(obj, fh)
+        os.replace(tmp, QUEUE_FILE)
+    finally:
+        _release_lock()
+
+
+# ------------------------
+# Validation
+# ------------------------
+
+def _is_comment_valid(text):
+    if not text or not text.strip():
+        return False
+
+    if re.search(r'http[s]?://', text):
+        return False
+
+    if EMOJI_RE.search(text):
+        stripped = EMOJI_RE.sub('', text).strip()
+        if not stripped:
+            return False
+
+    if len(text.split()) < 2:
+        return False
+
+    if len(text.strip()) < 4:
+        return False
+
+    if re.match(r'^(.)\1{5,}$', text.strip()):
+        return False
+
+    return True
+
+
+# ------------------------
+# OpenAI short reply (sanitized)
+# ------------------------
+
+def _sanitize_reply(text):
+    # Remove punctuation and digits; collapse whitespace
+    text = re.sub(r'[0-9]', '', text)
+    text = re.sub(r'[\.,:;!\?\-\—"\'\(\)\[\]\{\}…]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def _generate_short_reply(client, model_name, comment, user, language='en'):
+    if language == 'es':
+        system = (
+            'Eres un comentarista en vivo calmado y profesional '
+            'Responde con una o dos frases cortas en tono reflexivo '
+            'No des consejos de trading ni uses numeros ni signos de puntuacion'
+        )
+        user_prompt = f'Un espectador {user} dijo {comment}'
+    else:
+        system = (
+            'You are a calm professional live commentator. Reply with one or two short sentences in a reflective tone '
+            'Do not give trading advice do not use numbers or punctuation'
+        )
+        user_prompt = f'A viewer {user} commented {comment}'
+
+    response = client.responses.create(
+        model=model_name,
+        input=[
+            { 'role': 'system', 'content': system },
+            { 'role': 'user', 'content': user_prompt },
+        ],
+        max_output_tokens=64,
+    )
+
+    text = getattr(response, 'output_text', '') or ''
+    if not text:
+        fragments = []
+        for item in response.output or []:
+            for c in item.get('content', []):
+                if c.get('type') == 'output_text':
+                    fragments.append(c.get('text', ''))
+        text = ' '.join(fragments)
+
+    text = text.strip()
+    text = _sanitize_reply(text)
+    # ensure short length
+    if len(text.split()) > 30:
+        text = ' '.join(text.split()[:30])
+    return text
+
+
+# ------------------------
+# COMMENT INGEST ENDPOINT (locked writes)
+# ------------------------
+
+@csrf_exempt
+def tiktok_comment(request):
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=400)
+
+    expected = os.environ.get('TIKTOK_SECRET', '')
+    incoming = request.headers.get('X-TIKTOK-SECRET', '')
+    if expected and incoming != expected:
+        return JsonResponse({'error': 'unauthorized'}, status=403)
+
+    try:
+        data = json.loads(request.body.decode('utf-8'))
+        comment = data.get('comment', '').strip()
+        user = data.get('user', '').strip() or 'viewer'
+        language = data.get('language', '').strip().lower() or 'en'
+    except Exception:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+
+    if not _is_comment_valid(comment):
+        return JsonResponse({'skipped': 'filter'}, status=200)
+
+    # atomic append to comments list
+    if not _acquire_lock():
+        return JsonResponse({'error': 'server busy try again'}, status=503)
+    try:
+        _ensure_queue()
+        with open(QUEUE_FILE, 'r', encoding='utf-8') as fh:
+            q = json.load(fh)
+
+        now = time.time()
+        if not q.get('window_start'):
+            q['window_start'] = now
+
+        q.setdefault('comments', []).append({
+            'user': user,
+            'comment': comment,
+            'time': now,
+            'language': language,
+        })
+
+        tmp = QUEUE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(q, fh)
+        os.replace(tmp, QUEUE_FILE)
+    finally:
+        _release_lock()
+
+    return JsonResponse({'stored': True})
+
+
+# ------------------------
+# PROCESS 1-MINUTE WINDOW (locked)
+# ------------------------
+
+def process_tiktok_comment_window():
+    if not _acquire_lock():
+        logger.info('Could not acquire lock to process window, skipping')
+        return
+
+    try:
+        _ensure_queue()
+        with open(QUEUE_FILE, 'r', encoding='utf-8') as fh:
+            q = json.load(fh)
+
+        now = time.time()
+        ws = q.get('window_start', 0)
+        if not ws or (now - ws) < 60:
+            return
+
+        comments = q.get('comments', []) or []
+        if not comments:
+            q['window_start'] = 0
+            with open(QUEUE_FILE + '.tmp', 'w', encoding='utf-8') as fh:
+                json.dump(q, fh)
+            os.replace(QUEUE_FILE + '.tmp', QUEUE_FILE)
+            return
+
+        # limit batch size for performance
+        batch = comments[:MAX_BATCH_COMMENTS]
+
+        client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
+        model_name = os.environ.get('OPENAI_MODEL', 'gpt-5-mini')
+
+        spoken_entries = []
+        for item in batch:
+            reply = _generate_short_reply(client, model_name, item['comment'], item['user'], language=item.get('language', 'en'))
+            # Build exact spoken format required
+            # We have a comment From USERNAME Comment says ORIGINAL_COMMENT My response is REPLY_TEXT
+            entry = f"We have a comment From {item['user']} Comment says {item['comment']} My response is {reply}"
+            spoken_entries.append(entry)
+
+        combined_text = "\n".join(spoken_entries)
+
+        # choose language for TTS: if majority of comments are spanish, use spanish
+        lang_counts = { 'en': 0, 'es': 0 }
+        for c in batch:
+            lang_counts[c.get('language', 'en')] = lang_counts.get(c.get('language', 'en'), 0) + 1
+        tts_lang = 'es' if lang_counts.get('es', 0) > lang_counts.get('en', 0) else 'en'
+
+        tts_model = TTS_MODELS.get(tts_lang, TTS_MODELS['en'])
+        # Use local model if exists
+        local_models_root = os.environ.get('TTS_MODEL_PATH', '/app/tts_models')
+        safe_name = tts_model.replace('/', '_')
+        local_model_path = os.path.join(local_models_root, safe_name)
+
+        # generate audio to temp file then atomically move
+        uid = uuid.uuid4().hex[:12]
+        filename = f"reply_batch_{int(now)}_{uid}.wav"
+        temp_path = os.path.join(settings.MEDIA_ROOT, filename + '.tmp')
+        final_path = os.path.join(settings.MEDIA_ROOT, filename)
+
+        if os.path.isdir(local_model_path):
+            tts = TTS(model_name=local_model_path, progress_bar=False, gpu=False)
+        else:
+            tts = TTS(model_name=tts_model, progress_bar=False, gpu=False)
+
+        tts.tts_to_file(text=combined_text, file_path=temp_path)
+        os.replace(temp_path, final_path)
+
+        # append to audio_queue and reset window
+        q.setdefault('audio_queue', []).append({'filename': filename, 'created': now})
+        q['window_start'] = 0
+        q['comments'] = comments[MAX_BATCH_COMMENTS:]
+
+        with open(QUEUE_FILE + '.tmp', 'w', encoding='utf-8') as fh:
+            json.dump(q, fh)
+        os.replace(QUEUE_FILE + '.tmp', QUEUE_FILE)
+
+    except Exception:
+        logger.exception('Error while processing tiktok comment window')
+    finally:
+        _release_lock()
+
+
+# ------------------------
+# PLAY NEXT AUDIO (locked pop)
+# ------------------------
+
+@csrf_exempt
+def next_reply(request):
+    if request.method != 'GET':
+        return JsonResponse({'error': 'GET required'}, status=400)
+
+    # IMPORTANT: process window first
+    try:
+        process_tiktok_comment_window()
+    except Exception:
+        logger.exception('process_tiktok_comment_window failed')
+
+    # pop next audio atomically
+    if not _acquire_lock():
+        return JsonResponse({'error': 'server busy try again'}, status=503)
+
+    try:
+        _ensure_queue()
+        with open(QUEUE_FILE, 'r', encoding='utf-8') as fh:
+            q = json.load(fh)
+
+        if not q.get('audio_queue'):
+            return JsonResponse({'found': False}, status=200)
+
+        entry = q['audio_queue'].pop(0)
+
+        with open(QUEUE_FILE + '.tmp', 'w', encoding='utf-8') as fh:
+            json.dump(q, fh)
+        os.replace(QUEUE_FILE + '.tmp', QUEUE_FILE)
+
+    finally:
+        _release_lock()
+
+    return JsonResponse({'found': True, 'url': settings.MEDIA_URL + entry['filename'], 'filename': entry['filename']})

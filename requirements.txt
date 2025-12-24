@@ -6,3 +6,6 @@ numpy
 scipy
 requests
 gunicorn
+TikTokLive==0.7.5
+pyee==9.0.4
+aiohttp
