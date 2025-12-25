@@ -241,6 +241,30 @@
         <div id="recordings" class="recordings-grid">Loading...</div>
       </div>
 
+      <!-- New: All Audio Files Manager -->
+      <div class="recordings-section" style="margin-top:18px">
+        <div class="recordings-header">
+          <h2 style="margin:0;font-size:1.05rem">All Audio Files</h2>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button id="refresh-all-audio" class="primary" style="padding:10px 12px">Refresh List</button>
+            <button id="play-all" class="primary" style="padding:10px 12px">Play All</button>
+            <button id="delete-all-audio" class="danger">Delete Selected</button>
+          </div>
+        </div>
+
+        <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
+          <label style="color:var(--muted);font-size:0.9rem">Filter:</label>
+          <select id="audio-filter">
+            <option value="all">All</option>
+            <option value="live">Live only</option>
+            <option value="reply">Replies only</option>
+            <option value="other">Other</option>
+          </select>
+        </div>
+
+        <div id="all-audio-list" class="recordings-grid">Loading...</div>
+      </div>
+
       <div class="footer">
         © Live Market Audio · AI Trader
       </div>

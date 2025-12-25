@@ -585,7 +585,7 @@ def go_live(request):
     # SPLIT FOR TTS
     # ------------------------
     if language == 'es':
-    text = add_spanish_pauses(text)
+        text = add_spanish_pauses(text)
 
     chunks = split_text_into_chunks(text, words_per_chunk=WORDS_PER_AUDIO)
 
@@ -642,6 +642,76 @@ def go_live(request):
 
 
 # ------------------------
+# List all audio files (live + reply + others)
+@csrf_exempt
+def list_all_audio(request):
+    if request.method != 'GET':
+        return JsonResponse({'error': 'GET required'}, status=400)
+
+    media_root = settings.MEDIA_ROOT
+    media_url = settings.MEDIA_URL
+    if not os.path.isdir(media_root):
+        return JsonResponse({'files': []})
+
+    files = []
+    for fn in os.listdir(media_root):
+        if not fn.lower().endswith(('.wav', '.mp3')):
+            continue
+        path = os.path.join(media_root, fn)
+        try:
+            stat = os.stat(path)
+            created = datetime.utcfromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S UTC')
+            size = stat.st_size
+        except Exception:
+            created = None
+            size = 0
+
+        if fn.startswith('live_'):
+            ftype = 'live'
+        elif fn.startswith('reply_batch_'):
+            ftype = 'reply'
+        else:
+            ftype = 'other'
+
+        files.append({
+            'filename': fn,
+            'url': media_url + fn,
+            'created': created,
+            'size': size,
+            'type': ftype
+        })
+
+    files = sorted(files, key=lambda x: x.get('created') or '', reverse=True)
+    return JsonResponse({'files': files})
+
+
+@csrf_exempt
+def delete_file(request):
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=400)
+
+    try:
+        data = json.loads(request.body.decode('utf-8'))
+        filename = data.get('filename', '')
+    except Exception:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+
+    if not filename or '/' in filename or '..' in filename:
+        return JsonResponse({'error': 'invalid filename'}, status=400)
+
+    path = os.path.join(settings.MEDIA_ROOT, os.path.basename(filename))
+    if not os.path.exists(path):
+        return JsonResponse({'error': 'not found'}, status=404)
+
+    try:
+        os.remove(path)
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)
+
+    return JsonResponse({'deleted': True})
+
+
+# ------------------------
 # TikTok comment -> 1-minute batch reply pipeline (concurrency-safe, atomic file handling)
 # ------------------------
 
@@ -651,9 +721,7 @@ import uuid
 logger = logging.getLogger(__name__)
 
 QUEUE_FILE = os.path.join(settings.MEDIA_ROOT, 'tiktok_reply_queue.json')
-LOCK_FILE = os.path.join(settings.MEDIA_ROOT, 'tiktok_reply_queue.lock')
 MAX_BATCH_COMMENTS = int(os.environ.get('TIKTOK_MAX_BATCH_COMMENTS', '20'))
-LOCK_TIMEOUT = float(os.environ.get('TIKTOK_LOCK_TIMEOUT', '5.0'))
 
 # Emoji regex
 try:
@@ -666,26 +734,39 @@ except re.error:
 # Simple file lock helpers
 # ------------------------
 
-def _acquire_lock(timeout=LOCK_TIMEOUT):
-    start = time.time()
-    while True:
+def _read_queue():
+    _ensure_queue()
+    with open(QUEUE_FILE, 'r', encoding='utf-8') as fh:
+        return json.load(fh)
+
+
+def _write_queue(q):
+    tmp = QUEUE_FILE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(q, fh)
+    os.replace(tmp, QUEUE_FILE)
+
+
+def atomic_update_queue(update_fn, retries=5, backoff=0.05):
+    """
+    Atomically read/modify/write the queue file by applying update_fn on the
+    current queue dict. Retries a few times to reduce race conditions.
+    update_fn should return the modified queue dict.
+    """
+    for _ in range(retries):
         try:
-            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
-            return True
-        except FileExistsError:
-            if time.time() - start > timeout:
-                return False
-            time.sleep(0.05)
-
-
-def _release_lock():
-    try:
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
-    except Exception:
-        logger.exception('Failed to release lock')
+            _ensure_queue()
+            with open(QUEUE_FILE, 'r', encoding='utf-8') as fh:
+                q = json.load(fh)
+            new_q = update_fn(q) or q
+            tmp = QUEUE_FILE + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(new_q, fh)
+            os.replace(tmp, QUEUE_FILE)
+            return new_q
+        except Exception:
+            time.sleep(backoff)
+    raise RuntimeError('Failed to update queue after retries')
 
 
 # ------------------------
@@ -819,32 +900,24 @@ def tiktok_comment(request):
     if not _is_comment_valid(comment):
         return JsonResponse({'skipped': 'filter'}, status=200)
 
-    if not _acquire_lock():
-        return JsonResponse({'error': 'server busy try again'}, status=503)
+    now = time.time()
 
-    try:
-        _ensure_queue()
-        with open(QUEUE_FILE, 'r', encoding='utf-8') as fh:
-            q = json.load(fh)
-
-        now = time.time()
+    def updater(q):
         if not q.get('window_start'):
             q['window_start'] = now
-
         q.setdefault('comments', []).append({
             'user': user,
             'comment': comment,
             'time': now,
             'language': language,
         })
+        return q
 
-        tmp = QUEUE_FILE + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as fh:
-            json.dump(q, fh)
-        os.replace(tmp, QUEUE_FILE)
-
-    finally:
-        _release_lock()
+    try:
+        atomic_update_queue(updater)
+    except Exception:
+        logger.exception('Failed to store tiktok comment')
+        return JsonResponse({'error': 'server error'}, status=500)
 
     return JsonResponse({'stored': True})
 
@@ -854,26 +927,41 @@ def tiktok_comment(request):
 # ------------------------
 
 def process_tiktok_comment_window():
-    if not _acquire_lock():
-        logger.info('Could not acquire lock to process window')
-        return
-
+    """
+    Process comments collected during the one minute window without using an external lock.
+    Uses an in-file 'processing' timestamp to ensure only one process handles a window at a time.
+    """
     try:
         _ensure_queue()
-        with open(QUEUE_FILE, 'r', encoding='utf-8') as fh:
-            q = json.load(fh)
-
+        q = _read_queue()
         now = time.time()
         ws = q.get('window_start', 0)
         if not ws or (now - ws) < 60:
             return
 
+        # Attempt to claim processing by setting 'processing' timestamp if not set or stale
+        def claim(q_local):
+            proc = q_local.get('processing', 0)
+            if proc and (now - proc) < 120:
+                return q_local  # already processing
+            q_local['processing'] = now
+            return q_local
+
+        q_after_claim = atomic_update_queue(claim)
+        if q_after_claim.get('processing') != now:
+            # someone else claimed processing
+            return
+
+        # reload fresh queue
+        q = _read_queue()
         comments = q.get('comments', []) or []
         if not comments:
-            q['window_start'] = 0
-            with open(QUEUE_FILE + '.tmp', 'w', encoding='utf-8') as fh:
-                json.dump(q, fh)
-            os.replace(QUEUE_FILE + '.tmp', QUEUE_FILE)
+            # nothing to do, clear processing flag
+            def clear_proc(qc):
+                qc.pop('processing', None)
+                qc['window_start'] = 0
+                return qc
+            atomic_update_queue(clear_proc)
             return
 
         batch = comments[:MAX_BATCH_COMMENTS]
@@ -923,22 +1011,21 @@ def process_tiktok_comment_window():
         tts.tts_to_file(text=combined_text, file_path=temp_path)
         os.replace(temp_path, final_path)
 
-        q.setdefault('audio_queue', []).append({
-            'filename': filename,
-            'created': now
-        })
-        q['window_start'] = 0
-        q['comments'] = comments[MAX_BATCH_COMMENTS:]
+        # update queue: append audio_queue, reset window_start, advance comments
+        def finish(q_finish):
+            q_finish.setdefault('audio_queue', []).append({
+                'filename': filename,
+                'created': now
+            })
+            q_finish['window_start'] = 0
+            q_finish['comments'] = comments[MAX_BATCH_COMMENTS:]
+            q_finish.pop('processing', None)
+            return q_finish
 
-        with open(QUEUE_FILE + '.tmp', 'w', encoding='utf-8') as fh:
-            json.dump(q, fh)
-        os.replace(QUEUE_FILE + '.tmp', QUEUE_FILE)
+        atomic_update_queue(finish)
 
     except Exception:
         logger.exception('Error while processing tiktok comment window')
-
-    finally:
-        _release_lock()
 
 
 # ------------------------
@@ -955,25 +1042,22 @@ def next_reply(request):
     except Exception:
         logger.exception('process_tiktok_comment_window failed')
 
-    if not _acquire_lock():
-        return JsonResponse({'error': 'server busy try again'}, status=503)
+    popped = {}
+    def pop_audio(q):
+        if not q.get('audio_queue'):
+            return q
+        popped['entry'] = q['audio_queue'].pop(0)
+        return q
 
     try:
-        _ensure_queue()
-        with open(QUEUE_FILE, 'r', encoding='utf-8') as fh:
-            q = json.load(fh)
+        q_after = atomic_update_queue(pop_audio)
+    except Exception:
+        logger.exception('Failed to pop next reply')
+        return JsonResponse({'error': 'server error'}, status=500)
 
-        if not q.get('audio_queue'):
-            return JsonResponse({'found': False})
-
-        entry = q['audio_queue'].pop(0)
-
-        with open(QUEUE_FILE + '.tmp', 'w', encoding='utf-8') as fh:
-            json.dump(q, fh)
-        os.replace(QUEUE_FILE + '.tmp', QUEUE_FILE)
-
-    finally:
-        _release_lock()
+    entry = popped.get('entry')
+    if not entry:
+        return JsonResponse({'found': False})
 
     return JsonResponse({
         'found': True,

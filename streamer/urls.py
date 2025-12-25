@@ -6,6 +6,8 @@ urlpatterns = [
     path('go-live/', views.go_live, name='go_live'),
     path('recordings/', views.list_recordings, name='list_recordings'),
     path('delete-recordings/', views.delete_all_recordings, name='delete_recordings'),
+    path('all-audio/', views.list_all_audio, name='list_all_audio'),
+    path('delete-file/', views.delete_file, name='delete_file'),
     
     # TikTok integration endpoints
     path('tiktok/comment/', views.tiktok_comment, name='tiktok_comment'),

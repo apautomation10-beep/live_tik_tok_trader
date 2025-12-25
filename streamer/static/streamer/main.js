@@ -294,4 +294,141 @@ function resumeCommentary() {
 setInterval(pollForReplies, 2000);
 
 // Load recordings on page load
-window.addEventListener('load', fetchRecordings);
+window.addEventListener('load', () => {
+  fetchRecordings();
+  fetchAllAudio();
+});
+
+// --- All Audio manager ---
+const allAudioList = document.getElementById('all-audio-list');
+const refreshAllBtn = document.getElementById('refresh-all-audio');
+const playAllBtn = document.getElementById('play-all');
+const deleteAllAudioBtn = document.getElementById('delete-all-audio');
+const audioFilter = document.getElementById('audio-filter');
+
+let allAudioFiles = [];
+let playlist = [];
+let playlistIndex = 0;
+
+async function fetchAllAudio() {
+  if (!allAudioList) return;
+  allAudioList.innerHTML = 'Loading...';
+  try {
+    const res = await fetch('/all-audio/');
+    const data = await res.json();
+    if (!res.ok) {
+      allAudioList.innerHTML = 'Failed to load audio files';
+      return;
+    }
+    allAudioFiles = data.files || [];
+    renderAllAudio();
+  } catch (err) {
+    allAudioList.innerHTML = 'Error loading audio files';
+    console.error(err);
+  }
+}
+
+function renderAllAudio() {
+  if (!allAudioList) return;
+  const filter = (audioFilter && audioFilter.value) || 'all';
+  const files = allAudioFiles.filter(f => filter === 'all' ? true : f.type === filter);
+  if (!files.length) {
+    allAudioList.innerHTML = '<div class="empty">No audio files</div>';
+    return;
+  }
+
+  const html = files.map(f => `
+    <div class="recording-card">
+      <div class="header"><div style="font-size:0.9rem">${f.filename}</div><div style="color:var(--muted);font-size:0.85rem">${f.created || ''} · ${Math.round(f.size/1024)} KB</div></div>
+      <div class="files">
+        <div class="file-row">
+          <audio controls src="${f.url}"></audio>
+          <a href="${f.url}" download style="color:var(--accent);font-weight:600;">Download</a>
+          <button data-fname="${f.filename}" class="delete-file" style="background:transparent;border:1px solid var(--border);color:var(--muted);padding:8px;border-radius:8px;margin-left:6px">Delete</button>
+        </div>
+      </div>
+    </div>
+  `).join('');
+
+  allAudioList.innerHTML = html;
+
+  // attach delete listeners
+  document.querySelectorAll('.delete-file').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const fn = btn.dataset.fname;
+      if (!confirm(`Delete ${fn}?`)) return;
+      btn.disabled = true;
+      try {
+        const res = await fetch('/delete-file/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename: fn })
+        });
+        const data = await res.json();
+        if (res.ok && data.deleted) {
+          await fetchAllAudio();
+          fetchRecordings();
+        } else {
+          alert('Delete failed: ' + (data.error || 'unknown'));
+        }
+      } catch (err) {
+        console.error('delete single failed', err);
+        alert('Delete failed');
+      }
+      btn.disabled = false;
+    });
+  });
+}
+
+if (refreshAllBtn) refreshAllBtn.addEventListener('click', fetchAllAudio);
+if (audioFilter) audioFilter.addEventListener('change', renderAllAudio);
+
+// Play All: build playlist from filter and sequentially play using audio element
+if (playAllBtn) {
+  playAllBtn.addEventListener('click', () => {
+    const filter = (audioFilter && audioFilter.value) || 'all';
+    playlist = allAudioFiles.filter(f => filter === 'all' ? true : f.type === filter).map(f => f.url);
+    if (!playlist.length) return alert('Nothing to play');
+    playlistIndex = 0;
+    // stop any reply playback
+    replyQueue = [];
+    isPlayingReply = false;
+    // start playback via player element
+    player.src = playlist[0];
+    player.play().catch(() => {});
+    playlistIndex = 1;
+    if (status) status.textContent = `Playing playlist 1 / ${playlist.length}`;
+  });
+}
+
+// advance playlist when player ends
+if (player) player.addEventListener('ended', () => {
+  if (playlist && playlistIndex < (playlist.length || 0)) {
+    player.src = playlist[playlistIndex];
+    player.play().catch(() => {});
+    playlistIndex++;
+    if (status) status.textContent = `Playing playlist ${playlistIndex} / ${playlist.length}`;
+  }
+});
+
+// Delete selected (bulk) - for convenience deletes all currently filtered files
+if (deleteAllAudioBtn) {
+  deleteAllAudioBtn.addEventListener('click', async () => {
+    if (!confirm('Delete all currently listed files? This cannot be undone.')) return;
+    const filter = (audioFilter && audioFilter.value) || 'all';
+    const filesToDelete = allAudioFiles.filter(f => filter === 'all' ? true : f.type === filter).map(f => f.filename);
+    for (const fn of filesToDelete) {
+      try {
+        await fetch('/delete-file/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename: fn })
+        });
+      } catch (err) {
+        console.error('bulk delete failed for', fn, err);
+      }
+    }
+    await fetchAllAudio();
+    fetchRecordings();
+  });
+}

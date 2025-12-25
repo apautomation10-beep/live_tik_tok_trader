@@ -46,25 +46,32 @@ async def send_comment_to_server(payload: dict):
     if SECRET:
         headers["X-TIKTOK-SECRET"] = SECRET
 
-    try:
-        async with http_session.post(
-            POST_URL,
-            json=payload,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            if resp.status == 200:
-                logger.info("Comment sent: %s", payload["comment"])
-            else:
-                logger.warning(
-                    "Server error %s: %s",
-                    resp.status,
-                    await resp.text(),
-                )
-    except asyncio.TimeoutError:
-        logger.warning("POST timeout for comment")
-    except Exception:
-        logger.exception("Failed sending comment")
+    for attempt in range(3):
+        try:
+            async with http_session.post(
+                POST_URL,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    logger.info("Comment sent: %s", payload["comment"])
+                    return
+                text = await resp.text()
+                logger.warning("Server error %s: %s", resp.status, text)
+                # retry on transient server errors
+                if resp.status in (429, 500, 502, 503, 504):
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                else:
+                    return
+        except asyncio.TimeoutError:
+            logger.warning("POST timeout for comment (attempt %s)", attempt + 1)
+            await asyncio.sleep(2 ** attempt)
+        except Exception:
+            logger.exception("Failed sending comment")
+            await asyncio.sleep(2 ** attempt)
+    logger.error("Giving up sending comment after retries: %s", payload["comment"])
 
 
 @client.on("comment")
