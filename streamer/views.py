@@ -437,12 +437,16 @@ def split_text_into_chunks(text, words_per_chunk=WORDS_PER_AUDIO):
         for i in range(0, len(words), words_per_chunk)
     ]
 
-
 def generate_long_commentary(client, model_name, base_prompt, max_tokens, parts=3):
+    """
+    Generate a long XAUUSD live commentary in multiple parts.
+    Handles both English and Spanish prompts.
+    Fixed for OpenAI Responses API (safe attribute access).
+    """
     full_text = ""
     last_context = ""
 
-    # detect Spanish from base prompt
+    # Detect Spanish from base prompt
     is_spanish = "espanol" in base_prompt.lower() or "español" in base_prompt.lower()
 
     for i in range(parts):
@@ -476,37 +480,72 @@ Follow all earlier rules
 Plain spoken English
 """
 
+        # 🔹 OpenAI call
         response = client.responses.create(
             model=model_name,
             input=[
-                {
-                    "role": "system",
-                    "content": prompt
-                }
+                {"role": "system", "content": prompt}
             ],
             max_output_tokens=max_tokens,
         )
 
+        # 🔹 Extract text safely
         text = getattr(response, "output_text", "")
         if not text:
             fragments = []
-            for item in response.output:
-                for c in item.get("content", []):
-                    if c.get("type") == "output_text":
-                        fragments.append(c.get("text", ""))
+            for item in getattr(response, "output", []) or []:
+                contents = getattr(item, "content", []) or []
+                for c in contents:
+                    if getattr(c, "type", None) == "output_text":
+                        fragments.append(getattr(c, "text", ""))
             text = " ".join(fragments)
 
+        # 🔹 Safety check
         if not text.strip():
-            raise ValueError("No text generated")
+            raise ValueError("No text generated from OpenAI")
 
+        # 🔹 Append to full text
         full_text += " " + text.strip()
 
+        # 🔹 Save last context for next part
         words = full_text.split()
         last_context = " ".join(words[-400:])
 
+        # 🔹 Small pause between parts
         time.sleep(1)
 
     return full_text.strip()
+
+
+
+def add_spanish_pauses(text):
+    """
+    Add natural pauses for Spanish TTS (Coqui vits)
+    Uses line breaks + soft pause words
+    """
+    pause_words = [
+        "bien",
+        "entonces",
+        "ahora",
+        "veamos esto",
+        "con calma",
+    ]
+
+    sentences = text.split(" ")
+    out = []
+    counter = 0
+
+    for word in sentences:
+        out.append(word)
+        counter += 1
+
+        # roughly every 18–22 words → pause
+        if counter >= 20:
+            pause = pause_words[counter % len(pause_words)]
+            out.append("\n\n" + pause + "\n\n")
+            counter = 0
+
+    return " ".join(out)
 
 
 @csrf_exempt
@@ -545,8 +584,10 @@ def go_live(request):
     # ------------------------
     # SPLIT FOR TTS
     # ------------------------
-    chunks = split_text_into_chunks(text, words_per_chunk=WORDS_PER_AUDIO)
+    if language == 'es':
+    text = add_spanish_pauses(text)
 
+    chunks = split_text_into_chunks(text, words_per_chunk=WORDS_PER_AUDIO)
 
     tts_model = TTS_MODELS.get(language, TTS_MODELS['en'])
     local_models_root = os.environ.get('TTS_MODEL_PATH', '/app/tts_models')
@@ -664,27 +705,6 @@ def _ensure_queue():
             }, fh)
 
 
-def _load_queue_locked():
-    if not _acquire_lock():
-        raise RuntimeError('Failed to acquire queue lock for load')
-    try:
-        _ensure_queue()
-        with open(QUEUE_FILE, 'r', encoding='utf-8') as fh:
-            return json.load(fh)
-    finally:
-        _release_lock()
-
-
-def _save_queue_locked(obj):
-    if not _acquire_lock():
-        raise RuntimeError('Failed to acquire queue lock for save')
-    try:
-        tmp = QUEUE_FILE + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as fh:
-            json.dump(obj, fh)
-        os.replace(tmp, QUEUE_FILE)
-    finally:
-        _release_lock()
 
 
 # ------------------------
@@ -726,7 +746,6 @@ def _sanitize_reply(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-
 def _generate_short_reply(client, model_name, comment, user, language='en'):
     if language == 'es':
         system = (
@@ -737,7 +756,8 @@ def _generate_short_reply(client, model_name, comment, user, language='en'):
         user_prompt = f'Un espectador {user} dijo {comment}'
     else:
         system = (
-            'You are a calm professional live commentator. Reply with one or two short sentences in a reflective tone '
+            'You are a calm professional live commentator '
+            'Reply with one or two short sentences in a reflective tone '
             'Do not give trading advice do not use numbers or punctuation'
         )
         user_prompt = f'A viewer {user} commented {comment}'
@@ -745,33 +765,39 @@ def _generate_short_reply(client, model_name, comment, user, language='en'):
     response = client.responses.create(
         model=model_name,
         input=[
-            { 'role': 'system', 'content': system },
-            { 'role': 'user', 'content': user_prompt },
+            {'role': 'system', 'content': system},
+            {'role': 'user', 'content': user_prompt},
         ],
         max_output_tokens=64,
     )
 
+    # ✅ Preferred path (new SDK)
     text = getattr(response, 'output_text', '') or ''
+
+    # ✅ Fallback for structured outputs
     if not text:
         fragments = []
-        for item in response.output or []:
-            for c in item.get('content', []):
-                if c.get('type') == 'output_text':
-                    fragments.append(c.get('text', ''))
+        for item in getattr(response, 'output', []) or []:
+            contents = getattr(item, 'content', []) or []
+            for c in contents:
+                c_type = getattr(c, 'type', None)
+                if c_type == 'output_text':
+                    fragments.append(getattr(c, 'text', ''))
         text = ' '.join(fragments)
 
     text = text.strip()
     text = _sanitize_reply(text)
-    # ensure short length
+
+    # hard safety limit
     if len(text.split()) > 30:
         text = ' '.join(text.split()[:30])
+
     return text
 
 
 # ------------------------
 # COMMENT INGEST ENDPOINT (locked writes)
 # ------------------------
-
 @csrf_exempt
 def tiktok_comment(request):
     if request.method != 'POST':
@@ -793,9 +819,9 @@ def tiktok_comment(request):
     if not _is_comment_valid(comment):
         return JsonResponse({'skipped': 'filter'}, status=200)
 
-    # atomic append to comments list
     if not _acquire_lock():
         return JsonResponse({'error': 'server busy try again'}, status=503)
+
     try:
         _ensure_queue()
         with open(QUEUE_FILE, 'r', encoding='utf-8') as fh:
@@ -816,6 +842,7 @@ def tiktok_comment(request):
         with open(tmp, 'w', encoding='utf-8') as fh:
             json.dump(q, fh)
         os.replace(tmp, QUEUE_FILE)
+
     finally:
         _release_lock()
 
@@ -823,12 +850,12 @@ def tiktok_comment(request):
 
 
 # ------------------------
-# PROCESS 1-MINUTE WINDOW (locked)
+# PROCESS 1-MINUTE WINDOW
 # ------------------------
 
 def process_tiktok_comment_window():
     if not _acquire_lock():
-        logger.info('Could not acquire lock to process window, skipping')
+        logger.info('Could not acquire lock to process window')
         return
 
     try:
@@ -849,7 +876,6 @@ def process_tiktok_comment_window():
             os.replace(QUEUE_FILE + '.tmp', QUEUE_FILE)
             return
 
-        # limit batch size for performance
         batch = comments[:MAX_BATCH_COMMENTS]
 
         client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
@@ -857,30 +883,36 @@ def process_tiktok_comment_window():
 
         spoken_entries = []
         for item in batch:
-            reply = _generate_short_reply(client, model_name, item['comment'], item['user'], language=item.get('language', 'en'))
-            # Build exact spoken format required
-            # We have a comment From USERNAME Comment says ORIGINAL_COMMENT My response is REPLY_TEXT
-            entry = f"We have a comment From {item['user']} Comment says {item['comment']} My response is {reply}"
+            reply = _generate_short_reply(
+                client,
+                model_name,
+                item['comment'],
+                item['user'],
+                language=item.get('language', 'en')
+            )
+
+            entry = (
+                f"We have a comment From {item['user']} "
+                f"Comment says {item['comment']} "
+                f"My response is {reply}"
+            )
             spoken_entries.append(entry)
 
         combined_text = "\n".join(spoken_entries)
 
-        # choose language for TTS: if majority of comments are spanish, use spanish
-        lang_counts = { 'en': 0, 'es': 0 }
+        lang_counts = {'en': 0, 'es': 0}
         for c in batch:
-            lang_counts[c.get('language', 'en')] = lang_counts.get(c.get('language', 'en'), 0) + 1
-        tts_lang = 'es' if lang_counts.get('es', 0) > lang_counts.get('en', 0) else 'en'
+            lang_counts[c.get('language', 'en')] += 1
+        tts_lang = 'es' if lang_counts['es'] > lang_counts['en'] else 'en'
 
         tts_model = TTS_MODELS.get(tts_lang, TTS_MODELS['en'])
-        # Use local model if exists
         local_models_root = os.environ.get('TTS_MODEL_PATH', '/app/tts_models')
         safe_name = tts_model.replace('/', '_')
         local_model_path = os.path.join(local_models_root, safe_name)
 
-        # generate audio to temp file then atomically move
         uid = uuid.uuid4().hex[:12]
         filename = f"reply_batch_{int(now)}_{uid}.wav"
-        temp_path = os.path.join(settings.MEDIA_ROOT, filename + '.tmp')
+        temp_path = os.path.join(settings.MEDIA_ROOT, filename.replace('.wav', '_tmp.wav'))
         final_path = os.path.join(settings.MEDIA_ROOT, filename)
 
         if os.path.isdir(local_model_path):
@@ -891,8 +923,10 @@ def process_tiktok_comment_window():
         tts.tts_to_file(text=combined_text, file_path=temp_path)
         os.replace(temp_path, final_path)
 
-        # append to audio_queue and reset window
-        q.setdefault('audio_queue', []).append({'filename': filename, 'created': now})
+        q.setdefault('audio_queue', []).append({
+            'filename': filename,
+            'created': now
+        })
         q['window_start'] = 0
         q['comments'] = comments[MAX_BATCH_COMMENTS:]
 
@@ -902,12 +936,13 @@ def process_tiktok_comment_window():
 
     except Exception:
         logger.exception('Error while processing tiktok comment window')
+
     finally:
         _release_lock()
 
 
 # ------------------------
-# PLAY NEXT AUDIO (locked pop)
+# PLAY NEXT AUDIO
 # ------------------------
 
 @csrf_exempt
@@ -915,13 +950,11 @@ def next_reply(request):
     if request.method != 'GET':
         return JsonResponse({'error': 'GET required'}, status=400)
 
-    # IMPORTANT: process window first
     try:
         process_tiktok_comment_window()
     except Exception:
         logger.exception('process_tiktok_comment_window failed')
 
-    # pop next audio atomically
     if not _acquire_lock():
         return JsonResponse({'error': 'server busy try again'}, status=503)
 
@@ -931,7 +964,7 @@ def next_reply(request):
             q = json.load(fh)
 
         if not q.get('audio_queue'):
-            return JsonResponse({'found': False}, status=200)
+            return JsonResponse({'found': False})
 
         entry = q['audio_queue'].pop(0)
 
@@ -942,4 +975,8 @@ def next_reply(request):
     finally:
         _release_lock()
 
-    return JsonResponse({'found': True, 'url': settings.MEDIA_URL + entry['filename'], 'filename': entry['filename']})
+    return JsonResponse({
+        'found': True,
+        'url': settings.MEDIA_URL + entry['filename'],
+        'filename': entry['filename']
+    })
