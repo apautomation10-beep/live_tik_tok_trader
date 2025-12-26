@@ -63,8 +63,8 @@ function renderSessions(sessions) {
   }
 
   const html = sessions.map(s => `
-    <div class="recording-card">
-      <div class="header"><div class="when">${s.created_at}</div><div class="count">${s.files.length} segments</div></div>
+    <div class="recording-card" data-session="${s.session}">
+      <div class="header"><div class="when">${s.created_at}</div><div style="display:flex;gap:8px;align-items:center"><div class="count">${s.files.length} segments</div><button class="play-session" data-session="${s.session}" style="padding:6px 8px;border-radius:8px;border:none;background:#2b6cb0;color:white;font-weight:700;margin-left:8px">Play Session</button></div></div>
       <div class="files">
         ${s.files.map(f => `
           <div class="file-row">
@@ -77,6 +77,33 @@ function renderSessions(sessions) {
   `).join('');
 
   recordingsContainer.innerHTML = html;
+
+  // attach play-session handlers that play that session's files in index order
+  document.querySelectorAll('.play-session').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const sId = btn.dataset.session;
+      const sObj = sessions.find(x => String(x.session) === String(sId));
+      if (!sObj) return;
+
+      const idxFromFn = (fn) => {
+        try {
+          const m = fn.match(/_(\d+)\.(wav|mp3)$/);
+          return m ? parseInt(m[1], 10) : 0;
+        } catch (e) {
+          return 0;
+        }
+      };
+
+      const files = (sObj.files || []).slice().sort((a, b) => idxFromFn(a.filename) - idxFromFn(b.filename));
+      audioQueue = files.map(f => f.url);
+      currentIndex = 0;
+      if (audioQueue.length) {
+        player.src = audioQueue[0];
+        player.play().catch(() => {});
+        if (status) status.textContent = `Playing session ${sId} (${audioQueue.length} segments)`;
+      }
+    });
+  });
 }
 
 /** Delete all recordings (commentary and replies) */
@@ -123,22 +150,34 @@ if (goLiveBtn) {
       const res = await fetch('/go-live/', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ language: (langSelect && langSelect.value) || 'en' })
+        body: JSON.stringify({ language: (langSelect && langSelect.value) || 'en', parts: 6 })
       });
 
       const data = await res.json();
 
-      if (!res.ok || data.status !== 'queued' || !data.session_ts) {
+      if (!res.ok || data.status !== 'queued' || !data.session) {
         if (status) status.textContent = 'Error: ' + (data.error || 'Failed to queue live session');
         if (goLiveBtn) goLiveBtn.disabled = false;
         return;
       }
 
-      const sessionId = data.session_ts;
+      const sessionId = data.session;
       const total = data.total_chunks || 0;
-      if (status) status.textContent = `Session queued with ${total} segments. Waiting for generation...`;
+      if (status) status.textContent = `Session queued. Waiting for generation...`;
 
-      // poll recordings for this session until we have all segments
+      // allow manual start via Start Now button
+      let forceStart = false;
+      const startNowBtn = document.getElementById('start-now');
+      if (startNowBtn) {
+        const onStartNow = () => {
+          forceStart = true;
+          startNowBtn.disabled = true;
+          if (status) status.textContent = 'Manually starting playback when audio arrives...';
+        };
+        startNowBtn.addEventListener('click', onStartNow);
+      }
+
+      // poll recordings for this session until we have all segments or play as they arrive
       let pollTimer = null;
       const pollFn = async () => {
         try {
@@ -161,12 +200,13 @@ if (goLiveBtn) {
               playNext();
             }
           } else {
-            // total unknown: start playing as soon as at least one file appears
-            if (have > 0 && audioQueue.length === 0) {
+            // total unknown: wait until a buffer threshold (e.g., 30) or manual start
+            if ((have >= 30 || forceStart) && audioQueue.length === 0) {
               const files = (found.files || []).sort((a,b) => a.filename.localeCompare(b.filename));
               audioQueue = files.map(f => f.url);
               if (status) status.textContent = `Starting live audio (1 / ${audioQueue.length})`;
               fetchRecordings();
+              if (pollTimer) clearInterval(pollTimer);
               playNext();
             } else if (have > 0 && audioQueue.length > 0) {
               // append any newly generated files

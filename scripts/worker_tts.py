@@ -140,26 +140,37 @@ def load_models():
 
 
 def find_next_job(queue):
-    """Return the first job dict to process or None.
+    """Return the first TTS chunk job to process or None.
 
-    Criteria: status == 'pending' OR status == 'processing' but the file is missing
-    (this allows recovering jobs that were in processing when worker died).
+    Criteria: status == 'pending' OR status == 'processing' but the expected
+    file is missing (allows recovery after crashes).
+    Queue items are expected to have: session, index, text, status.
     """
     for job in queue:
         status = job.get('status')
-        filename = job.get('filename') or ''
-        path = os.path.join(settings.MEDIA_ROOT, filename)
+        # support legacy keys (session_ts/idx) for backward compatibility
+        session = job.get('session') if job.get('session') is not None else job.get('session_ts')
+        index = job.get('index') if job.get('index') is not None else job.get('idx')
         if status == 'pending':
             return job
-        if status == 'processing' and not os.path.exists(path):
-            return job
+        if status == 'processing':
+            # if file is missing, re-process it
+            try:
+                fn = f"live_{session}_{int(index):03d}.wav" if session is not None and index is not None else None
+            except Exception:
+                fn = None
+            if fn:
+                path = os.path.join(settings.MEDIA_ROOT, fn)
+                if not os.path.exists(path):
+                    return job
     return None
 
 
-def set_job_status(session_ts, idx, status_val):
+def set_job_status(session, index, status_val):
     def updater(q):
         for j in q:
-            if j.get('session_ts') == session_ts and j.get('idx') == idx:
+            # support legacy keys
+            if (j.get('session') == session and j.get('index') == index) or (j.get('session_ts') == session and j.get('idx') == index):
                 j['status'] = status_val
                 # update a timestamp to help debugging
                 j['updated_at'] = int(time.time())
@@ -182,25 +193,21 @@ def main_loop():
                 time.sleep(2)
                 continue
 
-            session_ts = job.get('session_ts')
-            idx = job.get('idx')
-            filename = job.get('filename')
-            language = job.get('language', 'en')
+
+            # get data from the job using the new schema
+            session = job.get('session')
+            index = int(job.get('index')) if job.get('index') is not None else 0
             text = job.get('text', '')
-            final_path = os.path.join(settings.MEDIA_ROOT, filename)
-
-            print(f'Claiming job session={session_ts} idx={idx} lang={language} filename={filename}')
-
-            job_type = job.get('type', 'tts')
+            language = job.get('language', 'en')
 
             # mark processing (atomic)
-            set_job_status(session_ts, idx, 'processing')
+            set_job_status(session, index, 'processing')
 
             # reload job (in case something changed)
             q2 = _read_tts_queue()
             myjob = None
             for j in q2:
-                if j.get('session_ts') == session_ts and j.get('idx') == idx and j.get('type', 'tts') == job_type:
+                if j.get('session') == session and int(j.get('index', -1)) == index:
                     myjob = j
                     break
 
@@ -208,116 +215,27 @@ def main_loop():
                 print('Job disappeared from queue, skipping')
                 continue
 
-            if job_type == 'generate':
-                # Run OpenAI to produce the full long text, then split into TTS jobs
-                print(f'Processing generate job session={session_ts} parts={myjob.get("parts")}')
-                client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
-                model_name = os.environ.get('OPENAI_MODEL', 'gpt-5-mini')
-                parts = int(myjob.get('parts', 3))
-                max_tokens = int(myjob.get('max_tokens', os.environ.get('OPENAI_MAX_TOKENS', '16000')))
-                base_prompt = myjob.get('prompt') or ''
+            filename = f"live_{session}_{index:03d}.wav"
+            final_path = os.path.join(settings.MEDIA_ROOT, filename)
 
-                try:
-                    text = generate_long_commentary(
-                        client=client,
-                        model_name=model_name,
-                        base_prompt=base_prompt,
-                        max_tokens=max_tokens,
-                        parts=parts
-                    )
-                except Exception:
-                    print('OpenAI generation failed', traceback.format_exc())
-                    # set back to pending so it can retry
-                    set_job_status(session_ts, idx, 'pending')
-                    time.sleep(2)
-                    continue
-
-                if myjob.get('language') == 'es':
-                    text = add_spanish_pauses(text)
-
-                chunks = split_text_into_chunks(text, words_per_chunk=WORDS_PER_AUDIO)
-
-                # Append TTS jobs atomically and update generate job with expected_chunks
-                def append_tts_jobs(qexisting):
-                    existing_keys = {(j.get('session_ts'), j.get('idx')) for j in qexisting}
-                    out = []
-                    updated = False
-                    for j in qexisting:
-                        if j.get('session_ts') == session_ts and j.get('type') == 'generate':
-                            # update the generate job to mark expected_chunks and done
-                            j['status'] = 'done'
-                            j['expected_chunks'] = len(chunks)
-                            j['updated_at'] = int(time.time())
-                            out.append(j)
-                            updated = True
-                        else:
-                            out.append(j)
-
-                    # append tts jobs
-                    for idx2, chunk in enumerate(chunks):
-                        key = (session_ts, idx2)
-                        filename2 = f"live_{session_ts}_{idx2}.wav"
-                        if key in existing_keys:
-                            continue
-                        out.append({
-                            'type': 'tts',
-                            'session_ts': session_ts,
-                            'idx': idx2,
-                            'language': myjob.get('language', 'en'),
-                            'text': chunk,
-                            'status': 'pending',
-                            'filename': filename2
-                        })
-                    # if generate job wasn't in queue for some reason, add a done marker
-                    if not updated:
-                        out.append({
-                            'type': 'generate',
-                            'session_ts': session_ts,
-                            'idx': -1,
-                            'language': myjob.get('language', 'en'),
-                            'prompt': myjob.get('prompt', ''),
-                            'parts': parts,
-                            'max_tokens': max_tokens,
-                            'status': 'done',
-                            'expected_chunks': len(chunks),
-                            'filename': ''
-                        })
-                    return out
-
-                try:
-                    atomic_update_tts_queue(append_tts_jobs)
-                    print(f'Enqueued {len(chunks)} TTS jobs for session {session_ts}')
-                except Exception:
-                    print('Failed to write TTS jobs to queue', traceback.format_exc())
-                    # try again later
-                    set_job_status(session_ts, idx, 'pending')
-                    time.sleep(2)
-                    continue
-
-                # done with generate job
-                gc.collect()
-                time.sleep(1)
-                continue
-
-            # -------------------------
-            # Normal TTS job processing
-            # -------------------------
+            # If file already exists, mark done and continue
             if os.path.exists(final_path):
                 print(f'File already exists {final_path}; marking done')
-                set_job_status(session_ts, idx, 'done')
+                set_job_status(session, index, 'done')
                 continue
 
             tts = tts_models.get(language)
             if not tts:
                 print(f'No TTS model loaded for language {language}; setting job back to pending')
-                set_job_status(session_ts, idx, 'pending')
+                set_job_status(session, index, 'pending')
                 time.sleep(1)
                 continue
 
             temp_path = final_path + '.tmp'
             try:
                 # generate audio to temp path
-                print(f'Generating audio to {temp_path} ...')
+                print(f'Generating audio for session={session} index={index} to {temp_path} ...')
+
                 if language == 'es':
                     tts.tts_to_file(
                         text=text,
@@ -331,17 +249,17 @@ def main_loop():
 
                 # atomic move into place
                 os.replace(temp_path, final_path)
-                set_job_status(session_ts, idx, 'done')
+                set_job_status(session, index, 'done')
                 print(f'Job complete: {final_path}')
 
             except Exception:
                 print('TTS generation failed', traceback.format_exc())
                 # reset to pending so it can be retried later
-                set_job_status(session_ts, idx, 'pending')
+                set_job_status(session, index, 'pending')
 
             # housekeeping
             gc.collect()
-            time.sleep(1)
+            time.sleep(0.3)
         except Exception:
             print('Worker main loop exception', traceback.format_exc())
             time.sleep(2)

@@ -582,9 +582,11 @@ def add_spanish_pauses(text):
 
 @csrf_exempt
 def go_live(request):
-    """Generate OpenAI text only, split into chunks, and enqueue TTS jobs on disk.
+    """Generate full commentary (synchronous), split into sentence-sized chunks
+    (<= 180 characters), and append them to MEDIA_ROOT/tts_queue.json as the
+    source-of-truth for the background TTS worker.
 
-    Returns immediately with session_ts, total_chunks and status queued.
+    Returns quickly after queueing all chunks with a session id and chunk count.
     """
     if request.method != 'POST':
         return JsonResponse({'error': 'POST required'}, status=400)
@@ -595,49 +597,84 @@ def go_live(request):
         return JsonResponse({'error': 'Invalid JSON'}, status=400)
 
     language = data.get('language', 'en')
+    parts = int(data.get('parts', 6))  # how many OpenAI parts to request for the long commentary
 
-    # ------------------------
-    # OPENAI (unchanged)
-    # ------------------------
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
     model_name = os.environ.get('OPENAI_MODEL', 'gpt-5-mini')
     max_tokens = int(os.environ.get('OPENAI_MAX_TOKENS', '16000'))
 
     prompt = PROMPT_ES if language == 'es' else PROMPT_EN
 
-    # Instead of running the OpenAI generation inside the HTTP request (which may
-    # time out on Hostinger), enqueue a lightweight 'generate' job which the
-    # background worker will pick up and turn into TTS jobs.
-    session_ts = int(time.time())
-
-    def _adder(q):
-        # q is a list of job dicts
-        existing = {(j.get('session_ts'), j.get('type')) for j in q}
-        key = (session_ts, 'generate')
-        if key in existing:
-            return q
-
-        job = {
-            'type': 'generate',
-            'session_ts': session_ts,
-            'idx': -1,
-            'language': language,
-            'prompt': prompt,
-            'parts': 3,
-            'max_tokens': max_tokens,
-            'status': 'pending',
-            'filename': ''
-        }
-        q.append(job)
-        return q
+    session = int(time.time())
 
     try:
-        atomic_update_tts_queue(_adder)
+        # Generate the full commentary synchronously (may be long if parts is large)
+        full_text = generate_long_commentary(client, model_name, prompt, max_tokens, parts=parts)
+
+        # Helper: split into sentences (try punctuation then word-based fallback) and ensure <=180 chars
+        def split_into_sentences(text, max_chars=180):
+            # try a simple sentence splitter first
+            parts = re.split(r'(?<=[\.\!\?])\s+', text.strip())
+            if len(parts) < 2:
+                parts = [p for p in re.split(r'\n{1,2}', text.strip()) if p.strip()]
+            out = []
+            for p in parts:
+                p = p.strip()
+                if not p:
+                    continue
+                # if already short enough, keep
+                if len(p) <= max_chars:
+                    out.append(p)
+                    continue
+                # otherwise split on word boundaries into chunks
+                words = p.split()
+                cur = []
+                cur_len = 0
+                for w in words:
+                    if cur_len + len(w) + (1 if cur else 0) <= max_chars:
+                        cur.append(w)
+                        cur_len += len(w) + (1 if cur_len else 0)
+                    else:
+                        out.append(' '.join(cur))
+                        cur = [w]
+                        cur_len = len(w)
+                if cur:
+                    out.append(' '.join(cur))
+            # final sanitation: remove empty and strip
+            return [s.strip() for s in out if s.strip()]
+
+        chunks = split_into_sentences(full_text, max_chars=180)
+
+        if not chunks:
+            return JsonResponse({'error': 'No content generated'}, status=500)
+
+        # Atomically append chunk items to the tts queue
+        def _append_chunks(q):
+            # q is a list of {session,index,text,status}
+            # find existing highest index for this session
+            existing = [j for j in q if j.get('session') == session]
+            start_idx = max([j.get('index', -1) for j in existing], default=-1) + 1
+
+            for i, txt in enumerate(chunks):
+                item = {
+                    'session': session,
+                    'index': start_idx + i,
+                    'text': txt,
+                    'language': language,
+                    'status': 'pending'
+                }
+                q.append(item)
+            return q
+
+        newq = atomic_update_tts_queue(_append_chunks)
+
+        total = len([j for j in newq if j.get('session') == session])
+
+        return JsonResponse({'session': session, 'total_chunks': total, 'status': 'queued'})
+
     except Exception as e:
         traceback.print_exc()
-        return JsonResponse({'error': f'Failed to enqueue generate job {e}'}, status=500)
-
-    return JsonResponse({'session_ts': session_ts, 'total_chunks': 0, 'status': 'queued'})
+        return JsonResponse({'error': str(e)}, status=500)
 
 
 
@@ -710,6 +747,44 @@ def delete_file(request):
 
     return JsonResponse({'deleted': True})
 
+
+@csrf_exempt
+def tts_queue_status(request):
+    """Return a simple summary of the TTS queue for debugging and monitoring."""
+    if request.method != 'GET':
+        return JsonResponse({'error': 'GET required'}, status=400)
+
+    try:
+        q = _read_tts_queue()
+    except Exception:
+        return JsonResponse({'error': 'failed to read queue'}, status=500)
+
+    total = len(q)
+    pending = sum(1 for j in q if j.get('status') == 'pending')
+    processing = sum(1 for j in q if j.get('status') == 'processing')
+    done = sum(1 for j in q if j.get('status') == 'done')
+
+    sessions = {}
+    for j in q:
+        s = str(j.get('session') or 'global')
+        sessions.setdefault(s, {'jobs': 0, 'pending': 0, 'done': 0})
+        sessions[s]['jobs'] += 1
+        if j.get('status') == 'pending':
+            sessions[s]['pending'] += 1
+        if j.get('status') == 'done':
+            sessions[s]['done'] += 1
+
+    # provide first 50 jobs for inspection
+    sample = q[:50]
+
+    return JsonResponse({
+        'total_jobs': total,
+        'pending': pending,
+        'processing': processing,
+        'done': done,
+        'sessions': sessions,
+        'sample': sample,
+    })
 
 # ------------------------
 # TikTok comment -> 1-minute batch reply pipeline (concurrency-safe, atomic file handling)

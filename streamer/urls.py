@@ -12,4 +12,5 @@ urlpatterns = [
     # TikTok integration endpoints
     path('tiktok/comment/', views.tiktok_comment, name='tiktok_comment'),
     path('replies/next/', views.next_reply, name='next_reply'),
+    path('tts-queue-status/', views.tts_queue_status, name='tts_queue_status'),
 ]
