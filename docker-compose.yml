@@ -34,6 +34,9 @@ services:
       - web
     environment:
       - NNPACK_DISABLE=1
+      - OPENAI_API_KEY
+      - OPENAI_MODEL=gpt-5-mini
+      - OPENAI_MAX_TOKENS=16000
     volumes:
       - ./media:/app/media
       - tts_models:/app/tts_models

@@ -148,16 +148,37 @@ if (goLiveBtn) {
           const found = sessions.find(s => String(s.session) === String(sessionId));
           const have = (found && found.files && found.files.length) || 0;
 
-          if (status) status.textContent = `Generating audio ${have} / ${total}`;
+          if (total > 0) {
+            if (status) status.textContent = `Generating audio ${have} / ${total}`;
 
-          if (have >= total && total > 0) {
-            // build audio queue sorted by filename
-            const files = (found.files || []).sort((a,b) => a.filename.localeCompare(b.filename));
-            audioQueue = files.map(f => f.url);
-            if (status) status.textContent = `Starting live audio (1 / ${audioQueue.length})`;
-            fetchRecordings();
-            if (pollTimer) clearInterval(pollTimer);
-            playNext();
+            if (have >= total && total > 0) {
+              // build audio queue sorted by filename
+              const files = (found.files || []).sort((a,b) => a.filename.localeCompare(b.filename));
+              audioQueue = files.map(f => f.url);
+              if (status) status.textContent = `Starting live audio (1 / ${audioQueue.length})`;
+              fetchRecordings();
+              if (pollTimer) clearInterval(pollTimer);
+              playNext();
+            }
+          } else {
+            // total unknown: start playing as soon as at least one file appears
+            if (have > 0 && audioQueue.length === 0) {
+              const files = (found.files || []).sort((a,b) => a.filename.localeCompare(b.filename));
+              audioQueue = files.map(f => f.url);
+              if (status) status.textContent = `Starting live audio (1 / ${audioQueue.length})`;
+              fetchRecordings();
+              playNext();
+            } else if (have > 0 && audioQueue.length > 0) {
+              // append any newly generated files
+              const files = (found.files || []).sort((a,b) => a.filename.localeCompare(b.filename));
+              const urls = files.map(f => f.url);
+              for (const u of urls) {
+                if (!audioQueue.includes(u)) {
+                  audioQueue.push(u);
+                  if (status) status.textContent = `Received new audio (total ${audioQueue.length})`;
+                }
+              }
+            }
           }
         } catch (err) {
           console.error('Polling recordings failed', err);

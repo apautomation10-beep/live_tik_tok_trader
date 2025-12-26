@@ -491,7 +491,7 @@ Plain spoken English
         response = client.responses.create(
             model=model_name,
             input=[
-                {"role": "system", "content": prompt}
+                {"role": "user", "content": prompt}
             ],
             max_output_tokens=max_tokens,
         )
@@ -580,54 +580,39 @@ def go_live(request):
 
     prompt = PROMPT_ES if language == 'es' else PROMPT_EN
 
-    try:
-        text = generate_long_commentary(
-            client=client,
-            model_name=model_name,
-            base_prompt=prompt,
-            max_tokens=max_tokens,
-            parts=3  # reduced from 6 to 3
-        )
-    except Exception as e:
-        traceback.print_exc()
-        return JsonResponse({'error': f'OpenAI failed {e}'}, status=500)
-
-    # ------------------------
-    # SPLIT into chunks and enqueue on disk
-    # ------------------------
-    if language == 'es':
-        text = add_spanish_pauses(text)
-
-    chunks = split_text_into_chunks(text, words_per_chunk=WORDS_PER_AUDIO)
-
+    # Instead of running the OpenAI generation inside the HTTP request (which may
+    # time out on Hostinger), enqueue a lightweight 'generate' job which the
+    # background worker will pick up and turn into TTS jobs.
     session_ts = int(time.time())
 
     def _adder(q):
         # q is a list of job dicts
-        existing = {(j.get('session_ts'), j.get('idx')) for j in q}
-        for idx, chunk in enumerate(chunks):
-            key = (session_ts, idx)
-            filename = f"live_{session_ts}_{idx}.wav"
-            if key in existing:
-                continue
-            job = {
-                'session_ts': session_ts,
-                'idx': idx,
-                'language': language,
-                'text': chunk,
-                'status': 'pending',
-                'filename': filename
-            }
-            q.append(job)
+        existing = {(j.get('session_ts'), j.get('type')) for j in q}
+        key = (session_ts, 'generate')
+        if key in existing:
+            return q
+
+        job = {
+            'type': 'generate',
+            'session_ts': session_ts,
+            'idx': -1,
+            'language': language,
+            'prompt': prompt,
+            'parts': 3,
+            'max_tokens': max_tokens,
+            'status': 'pending',
+            'filename': ''
+        }
+        q.append(job)
         return q
 
     try:
         atomic_update_tts_queue(_adder)
     except Exception as e:
         traceback.print_exc()
-        return JsonResponse({'error': f'Failed to enqueue TTS jobs {e}'}, status=500)
+        return JsonResponse({'error': f'Failed to enqueue generate job {e}'}, status=500)
 
-    return JsonResponse({'session_ts': session_ts, 'total_chunks': len(chunks), 'status': 'queued'})
+    return JsonResponse({'session_ts': session_ts, 'total_chunks': 0, 'status': 'queued'})
 
 
 
@@ -969,10 +954,19 @@ def tiktok_comment(request):
     return JsonResponse({'stored': True})
 
 
+def _window_ready():
+    try:
+        q = _read_queue()
+        ws = q.get('window_start', 0)
+        if not ws:
+            return False
+        return (time.time() - ws) >= 60
+    except Exception:
+        return False
+
 # ------------------------
 # PROCESS 1-MINUTE WINDOW
 # ------------------------
-
 def process_tiktok_comment_window():
     """
     Process comments collected during the one minute window without using an external lock.
@@ -986,24 +980,20 @@ def process_tiktok_comment_window():
         if not ws or (now - ws) < 60:
             return
 
-        # Attempt to claim processing by setting 'processing' timestamp if not set or stale
         def claim(q_local):
             proc = q_local.get('processing', 0)
             if proc and (now - proc) < 120:
-                return q_local  # already processing
+                return q_local
             q_local['processing'] = now
             return q_local
 
         q_after_claim = atomic_update_queue(claim)
         if q_after_claim.get('processing') != now:
-            # someone else claimed processing
             return
 
-        # reload fresh queue
         q = _read_queue()
         comments = q.get('comments', []) or []
         if not comments:
-            # nothing to do, clear processing flag
             def clear_proc(qc):
                 qc.pop('processing', None)
                 qc['window_start'] = 0
@@ -1058,7 +1048,6 @@ def process_tiktok_comment_window():
         tts.tts_to_file(text=combined_text, file_path=temp_path)
         os.replace(temp_path, final_path)
 
-        # update queue: append audio_queue, reset window_start, advance comments
         def finish(q_finish):
             q_finish.setdefault('audio_queue', []).append({
                 'filename': filename,
@@ -1074,22 +1063,20 @@ def process_tiktok_comment_window():
     except Exception:
         logger.exception('Error while processing tiktok comment window')
 
-
-# ------------------------
-# PLAY NEXT AUDIO
-# ------------------------
-
 @csrf_exempt
 def next_reply(request):
     if request.method != 'GET':
         return JsonResponse({'error': 'GET required'}, status=400)
 
-    try:
-        process_tiktok_comment_window()
-    except Exception:
-        logger.exception('process_tiktok_comment_window failed')
+    # ✅ FIX: only process when window is actually ready
+    if _window_ready():
+        try:
+            process_tiktok_comment_window()
+        except Exception:
+            logger.exception('process_tiktok_comment_window failed')
 
     popped = {}
+
     def pop_audio(q):
         if not q.get('audio_queue'):
             return q
@@ -1097,7 +1084,7 @@ def next_reply(request):
         return q
 
     try:
-        q_after = atomic_update_queue(pop_audio)
+        atomic_update_queue(pop_audio)
     except Exception:
         logger.exception('Failed to pop next reply')
         return JsonResponse({'error': 'server error'}, status=500)

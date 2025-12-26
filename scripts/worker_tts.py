@@ -24,24 +24,54 @@ import traceback
 
 # Ensure Django settings are available
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'live_tts_project.settings')
+
+# Ensure the project root is on sys.path. When this script is executed directly
+# (e.g. /app/scripts/worker_tts.py) sys.path[0] will be the scripts folder, so
+# imports like `import live_tts_project` may fail unless the repo root is added.
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 try:
     import django
     django.setup()
+except ModuleNotFoundError as e:
+    print('Failed to setup Django (module not found):', e)
+    print('Checked PROJECT_ROOT:', PROJECT_ROOT)
+    print('sys.path (first entries):', sys.path[:5])
+    raise
 except Exception as e:
     print('Failed to setup Django:', e)
     raise
 
 from django.conf import settings
 from TTS.api import TTS
+from openai import OpenAI
 
-# Try to reuse model mapping from streamer.views if available
+# Try to reuse helpers and model mapping from streamer.views if available
 try:
-    from streamer.views import TTS_MODELS
+    from streamer.views import (
+        TTS_MODELS,
+        generate_long_commentary,
+        add_spanish_pauses,
+        split_text_into_chunks,
+        WORDS_PER_AUDIO,
+    )
 except Exception:
     TTS_MODELS = {
         'en': 'tts_models/en/ljspeech/tacotron2-DDC',
         'es': 'tts_models/es/css10/vits',
     }
+    # Fallback helpers (small standins)
+    def split_text_into_chunks(text, words_per_chunk=250):
+        words = text.split()
+        return [" ".join(words[i:i + words_per_chunk]) for i in range(0, len(words), words_per_chunk)]
+    def add_spanish_pauses(text):
+        return text
+    def generate_long_commentary(client, model_name, base_prompt, max_tokens, parts=3):
+        # Very small fallback -- in practice the worker will import the real function.
+        return base_prompt
+    WORDS_PER_AUDIO = 250
 
 TTS_MODEL_ROOT = os.environ.get('TTS_MODEL_PATH', '/app/tts_models')
 TTS_QUEUE_FILE = os.path.join(settings.MEDIA_ROOT, 'tts_queue.json')
@@ -161,6 +191,8 @@ def main_loop():
 
             print(f'Claiming job session={session_ts} idx={idx} lang={language} filename={filename}')
 
+            job_type = job.get('type', 'tts')
+
             # mark processing (atomic)
             set_job_status(session_ts, idx, 'processing')
 
@@ -168,7 +200,7 @@ def main_loop():
             q2 = _read_tts_queue()
             myjob = None
             for j in q2:
-                if j.get('session_ts') == session_ts and j.get('idx') == idx:
+                if j.get('session_ts') == session_ts and j.get('idx') == idx and j.get('type', 'tts') == job_type:
                     myjob = j
                     break
 
@@ -176,7 +208,100 @@ def main_loop():
                 print('Job disappeared from queue, skipping')
                 continue
 
-            # if file already exists, mark done
+            if job_type == 'generate':
+                # Run OpenAI to produce the full long text, then split into TTS jobs
+                print(f'Processing generate job session={session_ts} parts={myjob.get("parts")}')
+                client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
+                model_name = os.environ.get('OPENAI_MODEL', 'gpt-5-mini')
+                parts = int(myjob.get('parts', 3))
+                max_tokens = int(myjob.get('max_tokens', os.environ.get('OPENAI_MAX_TOKENS', '16000')))
+                base_prompt = myjob.get('prompt') or ''
+
+                try:
+                    text = generate_long_commentary(
+                        client=client,
+                        model_name=model_name,
+                        base_prompt=base_prompt,
+                        max_tokens=max_tokens,
+                        parts=parts
+                    )
+                except Exception:
+                    print('OpenAI generation failed', traceback.format_exc())
+                    # set back to pending so it can retry
+                    set_job_status(session_ts, idx, 'pending')
+                    time.sleep(2)
+                    continue
+
+                if myjob.get('language') == 'es':
+                    text = add_spanish_pauses(text)
+
+                chunks = split_text_into_chunks(text, words_per_chunk=WORDS_PER_AUDIO)
+
+                # Append TTS jobs atomically and update generate job with expected_chunks
+                def append_tts_jobs(qexisting):
+                    existing_keys = {(j.get('session_ts'), j.get('idx')) for j in qexisting}
+                    out = []
+                    updated = False
+                    for j in qexisting:
+                        if j.get('session_ts') == session_ts and j.get('type') == 'generate':
+                            # update the generate job to mark expected_chunks and done
+                            j['status'] = 'done'
+                            j['expected_chunks'] = len(chunks)
+                            j['updated_at'] = int(time.time())
+                            out.append(j)
+                            updated = True
+                        else:
+                            out.append(j)
+
+                    # append tts jobs
+                    for idx2, chunk in enumerate(chunks):
+                        key = (session_ts, idx2)
+                        filename2 = f"live_{session_ts}_{idx2}.wav"
+                        if key in existing_keys:
+                            continue
+                        out.append({
+                            'type': 'tts',
+                            'session_ts': session_ts,
+                            'idx': idx2,
+                            'language': myjob.get('language', 'en'),
+                            'text': chunk,
+                            'status': 'pending',
+                            'filename': filename2
+                        })
+                    # if generate job wasn't in queue for some reason, add a done marker
+                    if not updated:
+                        out.append({
+                            'type': 'generate',
+                            'session_ts': session_ts,
+                            'idx': -1,
+                            'language': myjob.get('language', 'en'),
+                            'prompt': myjob.get('prompt', ''),
+                            'parts': parts,
+                            'max_tokens': max_tokens,
+                            'status': 'done',
+                            'expected_chunks': len(chunks),
+                            'filename': ''
+                        })
+                    return out
+
+                try:
+                    atomic_update_tts_queue(append_tts_jobs)
+                    print(f'Enqueued {len(chunks)} TTS jobs for session {session_ts}')
+                except Exception:
+                    print('Failed to write TTS jobs to queue', traceback.format_exc())
+                    # try again later
+                    set_job_status(session_ts, idx, 'pending')
+                    time.sleep(2)
+                    continue
+
+                # done with generate job
+                gc.collect()
+                time.sleep(1)
+                continue
+
+            # -------------------------
+            # Normal TTS job processing
+            # -------------------------
             if os.path.exists(final_path):
                 print(f'File already exists {final_path}; marking done')
                 set_job_status(session_ts, idx, 'done')
@@ -217,7 +342,6 @@ def main_loop():
             # housekeeping
             gc.collect()
             time.sleep(1)
-
         except Exception:
             print('Worker main loop exception', traceback.format_exc())
             time.sleep(2)
