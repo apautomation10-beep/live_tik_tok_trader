@@ -1,9 +1,14 @@
 import os
 
-# 🔇 Disable PyTorch NNPACK warnings (unsupported CPU on VPS)
-os.environ["TORCH_SHOW_CPP_STACKTRACES"] = "0"
+# 🔒 HARD limits to prevent OOM (must be before torch import)
+os.environ["TORCH_DISABLE_NNPACK"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
-os.environ["NNPACK_DISABLE"] = "1"
+os.environ["TORCH_SHOW_CPP_STACKTRACES"] = "0"
 
 
 import time
@@ -23,6 +28,26 @@ from django.conf import settings
 from openai import OpenAI
 from TTS.api import TTS
 from TTS.utils.radam import RAdam
+
+# ------------------------
+# TTS SINGLETON CACHE (CRITICAL)
+# ------------------------
+
+_TTS_CACHE = {}
+
+def get_tts(model_name: str) -> TTS:
+    """
+    Load exactly ONE TTS model into memory.
+    Clears previous model to avoid OOM.
+    """
+    if model_name not in _TTS_CACHE:
+        _TTS_CACHE.clear()
+        _TTS_CACHE[model_name] = TTS(
+            model_name=model_name,
+            progress_bar=False,
+            gpu=False,
+        )
+    return _TTS_CACHE[model_name]
 
 # 🔥 PyTorch 2.6 compatibility for Coqui TTS
 torch.serialization.add_safe_globals([
@@ -369,7 +394,7 @@ TTS_MODELS = {
 }
 
 # ~3 minutes per audio
-WORDS_PER_AUDIO = 250
+WORDS_PER_AUDIO = 190
 
 
 def dashboard(request):
@@ -1040,10 +1065,10 @@ def process_tiktok_comment_window():
         temp_path = os.path.join(settings.MEDIA_ROOT, filename.replace('.wav', '_tmp.wav'))
         final_path = os.path.join(settings.MEDIA_ROOT, filename)
 
-        if os.path.isdir(local_model_path):
-            tts = TTS(model_name=local_model_path, progress_bar=False, gpu=False)
-        else:
-            tts = TTS(model_name=tts_model, progress_bar=False, gpu=False)
+        model_to_use = local_model_path if os.path.isdir(local_model_path) else tts_model
+        tts = get_tts(model_to_use)
+
+
 
         tts.tts_to_file(text=combined_text, file_path=temp_path)
         os.replace(temp_path, final_path)
