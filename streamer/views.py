@@ -394,7 +394,7 @@ TTS_MODELS = {
 }
 
 # ~3 minutes per audio
-WORDS_PER_AUDIO = 190
+WORDS_PER_AUDIO = 480
 
 
 def dashboard(request):
@@ -597,7 +597,7 @@ def go_live(request):
         return JsonResponse({'error': 'Invalid JSON'}, status=400)
 
     language = data.get('language', 'en')
-    parts = int(data.get('parts', 6))  # how many OpenAI parts to request for the long commentary
+    parts = int(data.get('parts', 4))  # how many OpenAI parts to request for the long commentary
 
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
     model_name = os.environ.get('OPENAI_MODEL', 'gpt-5-mini')
@@ -612,7 +612,7 @@ def go_live(request):
         full_text = generate_long_commentary(client, model_name, prompt, max_tokens, parts=parts)
 
         # Helper: split into sentences (try punctuation then word-based fallback) and ensure <=180 chars
-        def split_into_sentences(text, max_chars=180):
+        def split_into_sentences(text, max_chars=1500):
             # try a simple sentence splitter first
             parts = re.split(r'(?<=[\.\!\?])\s+', text.strip())
             if len(parts) < 2:
@@ -643,7 +643,8 @@ def go_live(request):
             # final sanitation: remove empty and strip
             return [s.strip() for s in out if s.strip()]
 
-        chunks = split_into_sentences(full_text, max_chars=180)
+        chunks = split_text_into_chunks(full_text, WORDS_PER_AUDIO)
+
 
         if not chunks:
             return JsonResponse({'error': 'No content generated'}, status=500)
