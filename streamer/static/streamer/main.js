@@ -109,7 +109,7 @@ if (refreshBtn) {
 if (goLiveBtn) {
   goLiveBtn.addEventListener('click', async () => {
     goLiveBtn.disabled = true;
-    if (status) status.textContent = 'Generating commentary and voice... please wait.';
+    if (status) status.textContent = 'Queued live generation... will play when audio is ready.';
     audioQueue = [];
     currentIndex = 0;
 
@@ -128,42 +128,46 @@ if (goLiveBtn) {
 
       const data = await res.json();
 
-      if (!res.ok || !data.audio_urls || data.audio_urls.length === 0) {
-        if (status) status.textContent = 'Error: ' + (data.error || 'No audio generated');
+      if (!res.ok || data.status !== 'queued' || !data.session_ts) {
+        if (status) status.textContent = 'Error: ' + (data.error || 'Failed to queue live session');
         if (goLiveBtn) goLiveBtn.disabled = false;
         return;
       }
 
-      audioQueue = data.audio_urls;
-      if (status) status.textContent = `Starting live audio (1 / ${audioQueue.length})`;
+      const sessionId = data.session_ts;
+      const total = data.total_chunks || 0;
+      if (status) status.textContent = `Session queued with ${total} segments. Waiting for generation...`;
 
-      // refresh recordings list after generation
-      fetchRecordings();
-
-      playNext();
-
-      // If server provided a session timestamp, open SSE to receive new audio pushes (if server supports it)
-      const sessionId = data.session_ts || null;
-      if (sessionId && typeof EventSource !== 'undefined') {
+      // poll recordings for this session until we have all segments
+      let pollTimer = null;
+      const pollFn = async () => {
         try {
-          sse = new EventSource(`/live-audio-sse/${sessionId}/`);
-          sse.addEventListener('new-audio', e => {
-            try {
-              const payload = JSON.parse(e.data);
-              if (payload && payload.url) {
-                audioQueue.push(payload.url);
-                // update UI
-                if (status) status.textContent = `Received new audio (total ${audioQueue.length})`;
-              }
-            } catch (err) {
-              console.error('Bad SSE payload', err);
-            }
-          });
-          sse.onerror = (err) => { console.warn('SSE error', err); };
-        } catch (e) {
-          console.warn('SSE not available', e);
+          const r = await fetch('/recordings/');
+          const payload = await r.json();
+          const sessions = payload.sessions || [];
+          const found = sessions.find(s => String(s.session) === String(sessionId));
+          const have = (found && found.files && found.files.length) || 0;
+
+          if (status) status.textContent = `Generating audio ${have} / ${total}`;
+
+          if (have >= total && total > 0) {
+            // build audio queue sorted by filename
+            const files = (found.files || []).sort((a,b) => a.filename.localeCompare(b.filename));
+            audioQueue = files.map(f => f.url);
+            if (status) status.textContent = `Starting live audio (1 / ${audioQueue.length})`;
+            fetchRecordings();
+            if (pollTimer) clearInterval(pollTimer);
+            playNext();
+          }
+        } catch (err) {
+          console.error('Polling recordings failed', err);
         }
-      }
+      };
+
+      // start polling every 2 seconds
+      pollTimer = setInterval(pollFn, 2000);
+      // run immediately once
+      pollFn();
 
     } catch (err) {
       if (status) status.textContent = 'Request failed: ' + err;

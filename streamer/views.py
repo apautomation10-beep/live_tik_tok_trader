@@ -1,4 +1,11 @@
 import os
+
+# 🔇 Disable PyTorch NNPACK warnings (unsupported CPU on VPS)
+os.environ["TORCH_SHOW_CPP_STACKTRACES"] = "0"
+os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
+os.environ["NNPACK_DISABLE"] = "1"
+
+
 import time
 import json
 import collections
@@ -550,6 +557,10 @@ def add_spanish_pauses(text):
 
 @csrf_exempt
 def go_live(request):
+    """Generate OpenAI text only, split into chunks, and enqueue TTS jobs on disk.
+
+    Returns immediately with session_ts, total_chunks and status queued.
+    """
     if request.method != 'POST':
         return JsonResponse({'error': 'POST required'}, status=400)
 
@@ -561,10 +572,10 @@ def go_live(request):
     language = data.get('language', 'en')
 
     # ------------------------
-    # OPENAI
+    # OPENAI (unchanged)
     # ------------------------
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    model_name = os.environ.get('OPENAI_MODEL', 'gpt-5-mini')  
+    model_name = os.environ.get('OPENAI_MODEL', 'gpt-5-mini')
     max_tokens = int(os.environ.get('OPENAI_MAX_TOKENS', '16000'))
 
     prompt = PROMPT_ES if language == 'es' else PROMPT_EN
@@ -582,62 +593,41 @@ def go_live(request):
         return JsonResponse({'error': f'OpenAI failed {e}'}, status=500)
 
     # ------------------------
-    # SPLIT FOR TTS
+    # SPLIT into chunks and enqueue on disk
     # ------------------------
     if language == 'es':
         text = add_spanish_pauses(text)
 
     chunks = split_text_into_chunks(text, words_per_chunk=WORDS_PER_AUDIO)
 
-    tts_model = TTS_MODELS.get(language, TTS_MODELS['en'])
-    local_models_root = os.environ.get('TTS_MODEL_PATH', '/app/tts_models')
-    safe_name = tts_model.replace('/', '_')
-    local_model_path = os.path.join(local_models_root, safe_name)
-
-    audio_urls = []
     session_ts = int(time.time())
 
-    try:
-        if os.path.isdir(local_model_path):
-            tts = TTS(model_name=local_model_path, progress_bar=False, gpu=False)
-        else:
-            tts = TTS(model_name=tts_model, progress_bar=False, gpu=False)
-
+    def _adder(q):
+        # q is a list of job dicts
+        existing = {(j.get('session_ts'), j.get('idx')) for j in q}
         for idx, chunk in enumerate(chunks):
+            key = (session_ts, idx)
             filename = f"live_{session_ts}_{idx}.wav"
-            filepath = os.path.join(settings.MEDIA_ROOT, filename)
+            if key in existing:
+                continue
+            job = {
+                'session_ts': session_ts,
+                'idx': idx,
+                'language': language,
+                'text': chunk,
+                'status': 'pending',
+                'filename': filename
+            }
+            q.append(job)
+        return q
 
-            if language == 'es':
-                tts.tts_to_file(
-                    text=chunk,
-                    file_path=filepath,
-                   length_scale=1.45,
-                    noise_scale=0.6,
-                    noise_scale_w=0.75
-
-                )
-            else:
-                tts.tts_to_file(
-                    text=chunk,
-                    file_path=filepath
-                )
-
-            audio_urls.append(settings.MEDIA_URL + filename)
-
+    try:
+        atomic_update_tts_queue(_adder)
     except Exception as e:
         traceback.print_exc()
-        return JsonResponse({'error': f'TTS failed {e}'}, status=500)
+        return JsonResponse({'error': f'Failed to enqueue TTS jobs {e}'}, status=500)
 
-    # ------------------------
-    # RESPONSE
-    # ------------------------
-    return JsonResponse({
-        'language': language,
-        'total_chunks': len(audio_urls),
-        'audio_urls': audio_urls,
-        'text': text,
-        'session_ts': session_ts
-    })
+    return JsonResponse({'session_ts': session_ts, 'total_chunks': len(chunks), 'status': 'queued'})
 
 
 
@@ -786,6 +776,58 @@ def _ensure_queue():
             }, fh)
 
 
+# ------------------------
+# TTS QUEUE (disk-based JSON queue for background worker)
+# ------------------------
+TTS_QUEUE_FILE = os.path.join(settings.MEDIA_ROOT, 'tts_queue.json')
+
+
+def _ensure_tts_queue():
+    if not os.path.isdir(settings.MEDIA_ROOT):
+        os.makedirs(settings.MEDIA_ROOT, exist_ok=True)
+
+    if not os.path.exists(TTS_QUEUE_FILE):
+        with open(TTS_QUEUE_FILE, 'w', encoding='utf-8') as fh:
+            json.dump([], fh)
+
+
+def _read_tts_queue():
+    _ensure_tts_queue()
+    with open(TTS_QUEUE_FILE, 'r', encoding='utf-8') as fh:
+        try:
+            return json.load(fh)
+        except Exception:
+            return []
+
+
+def _write_tts_queue(q):
+    tmp = TTS_QUEUE_FILE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(q, fh)
+    os.replace(tmp, TTS_QUEUE_FILE)
+
+
+def atomic_update_tts_queue(update_fn, retries=5, backoff=0.05):
+    """
+    Atomically read / modify / write the tts queue using a temp file + os.replace.
+    update_fn should accept the current queue (list) and return the modified queue.
+    """
+    for _ in range(retries):
+        try:
+            _ensure_tts_queue()
+            with open(TTS_QUEUE_FILE, 'r', encoding='utf-8') as fh:
+                q = json.load(fh)
+            new_q = update_fn(q) or q
+            tmp = TTS_QUEUE_FILE + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(new_q, fh)
+            os.replace(tmp, TTS_QUEUE_FILE)
+            return new_q
+        except Exception:
+            time.sleep(backoff)
+    raise RuntimeError('Failed to update tts queue after retries')
+
+
 
 
 # ------------------------
@@ -826,22 +868,27 @@ def _sanitize_reply(text):
     text = re.sub(r'[\.,:;!\?\-\—"\'\(\)\[\]\{\}…]', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
-
 def _generate_short_reply(client, model_name, comment, user, language='en'):
     if language == 'es':
         system = (
-            'Eres un comentarista en vivo calmado y profesional '
-            'Responde con una o dos frases cortas en tono reflexivo '
-            'No des consejos de trading ni uses numeros ni signos de puntuacion'
+            'Eres un anfitrion de TikTok en vivo calmado y profesional '
+            'Lee el comentario y responde directamente a la persona por su nombre '
+            'Habla como si estuvieras respondiendo en tiempo real en el chat '
+            'Usa una o dos frases cortas en tono natural y conversacional '
+            'No des consejos de trading '
+            'No uses numeros ni signos de puntuacion'
         )
-        user_prompt = f'Un espectador {user} dijo {comment}'
+        user_prompt = f'{user} dijo {comment}'
     else:
         system = (
-            'You are a calm professional live commentator '
-            'Reply with one or two short sentences in a reflective tone '
-            'Do not give trading advice do not use numbers or punctuation'
+            'You are a calm professional TikTok live host '
+            'Read the comment and reply directly to the person by name '
+            'Speak like you are responding in real time in the live chat '
+            'Use one or two short sentences in a natural conversational tone '
+            'Do not give trading advice '
+            'Do not use numbers or punctuation'
         )
-        user_prompt = f'A viewer {user} commented {comment}'
+        user_prompt = f'{user} said {comment}'
 
     response = client.responses.create(
         model=model_name,
